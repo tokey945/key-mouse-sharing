@@ -17,7 +17,7 @@ import {
 } from '@/components/ui/number-field'
 
 const role = ref('server')
-const ip = ref('192.168.')
+const ip = ref('192.168.1.5')
 const port = ref(4000)
 
 
@@ -85,7 +85,7 @@ const stop = async () => {
 <template>
   <div class="p-4 space-y-4">
     <Label>本机角色：</Label>
-    <RadioGroup default-value="server" :orientation="'horizontal'" class="flex space-x-4">
+    <RadioGroup v-model="role" default-value="server" :orientation="'horizontal'" class="flex space-x-4">
       <div class="flex items-center space-x-2">
         <RadioGroupItem id="r1" value="server" />
         <Label for="r1">控制端（发送）</Label>
