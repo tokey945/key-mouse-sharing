@@ -8,7 +8,7 @@ import ColorMode from "@/components/ColorMode.vue";
   <SidebarProvider>
     <AppSidebar />
     <main class="w-full h-screen flex flex-col">
-      <div class="flex items-center justify-between">
+      <div class="px-2 flex items-center justify-between">
         <SidebarTrigger />
         <ColorMode />
       </div>

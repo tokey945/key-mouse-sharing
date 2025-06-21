@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Calendar, Home, Inbox } from "lucide-vue-next"
+import { Keyboard, CloudUpload, ScreenShare } from "lucide-vue-next"
 import {
   Sidebar,
   SidebarContent,
@@ -10,23 +10,24 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
 } from "@/components/ui/sidebar"
-
+import { useRoute } from "vue-router";
+const route = useRoute();
 // Menu items.
 const items = [
   {
     title: "键鼠共享",
     url: "/",
-    icon: Home,
+    icon: Keyboard,
   },
   {
     title: "文件共享",
     url: "/file/sharing",
-    icon: Inbox,
+    icon: CloudUpload,
   },
   {
     title: "屏幕共享",
     url: "/screen/sharing",
-    icon: Calendar,
+    icon: ScreenShare,
   }
 ];
 </script>
@@ -39,7 +40,11 @@ const items = [
         <SidebarGroupContent>
           <SidebarMenu>
             <SidebarMenuItem v-for="item in items" :key="item.title">
-              <SidebarMenuButton asChild>
+              <SidebarMenuButton asChild :class="[
+                'transition-colors',
+                'hover:bg-accent',
+                route.path === item.url ? 'bg-accent' :
+                  'active:bg-accent']">
                 <RouterLink :to="item.url">
                   <component :is="item.icon" />
                   <span class="group-data-[collapsible=icon]:hidden">{{ item.title }}</span>
