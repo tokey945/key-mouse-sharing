@@ -2,8 +2,8 @@ use enigo::*;
 use rdev::display_size;
 use rdev::{listen, EventType};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::io::{BufRead, BufReader};
-use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -78,17 +78,26 @@ pub fn start_mouse_server(ip: String, port: u16) {
 
         // 鼠标监听线程，更新位置和共享状态
         thread::spawn(move || {
-            let (screen_width, _) = display_size().unwrap_or((1920, 1080));
+            let (screen_width, screen_height) = display_size().unwrap_or((1920, 1080));
+            println!("屏幕宽度: {}, 高度: {}", screen_width, screen_height);
+
             let callback = move |event: rdev::Event| {
                 if let EventType::MouseMove { x, y } = event.event_type {
+                    println!("当前鼠标位置: x = {}, y = {}", x, y);
+
                     let mut pos = pos_clone.lock().unwrap();
                     *pos = (x as i32, y as i32);
 
                     let mut sharing = is_sharing_clone.lock().unwrap();
                     let buffer = 10.0; // 缓冲区，防止边界抖动
-                    if x >= screen_width as f64 {
+
+                    // 注意：鼠标最大只会到 screen_width - 1
+                    if x >= (screen_width as f64 - 1.0) {
+                        println!("鼠标已移动到屏幕右边缘，x = {}", x);
+
                         *sharing = true;
                     } else if x < screen_width as f64 - buffer {
+                        println!("鼠标已离开屏幕右边缘，x = {}", x);
                         *sharing = false;
                     }
                 }
@@ -110,11 +119,13 @@ pub fn start_mouse_server(ip: String, port: u16) {
                         let sharing = *is_sharing.lock().unwrap();
                         // 只在状态切换时调用隐藏/显示光标
                         if sharing && !last_sharing {
+                            println!("调用 mac_cursor::hide_cursor()");
                             #[cfg(target_os = "macos")]
                             mac_cursor::hide_cursor();
                             #[cfg(target_os = "windows")]
                             win_cursor::hide_cursor();
                         } else if !sharing && last_sharing {
+                            println!("调用 mac_cursor::show_cursor()");
                             #[cfg(target_os = "macos")]
                             mac_cursor::show_cursor();
                             #[cfg(target_os = "windows")]
@@ -156,13 +167,48 @@ pub fn start_mouse_server(ip: String, port: u16) {
 #[cfg(target_os = "macos")]
 mod mac_cursor {
     use core_graphics::display::{CGDisplayHideCursor, CGDisplayShowCursor, CGMainDisplayID};
+    use std::sync::Once;
+
+    use core_foundation::base::TCFType;
+    use core_foundation::boolean::kCFBooleanTrue;
+    use core_foundation::string::CFString;
+
+    static INIT: Once = Once::new();
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn _CGSDefaultConnection() -> i32;
+        fn CGSSetConnectionProperty(
+            cid: i32,
+            cid2: i32,
+            key: *const std::ffi::c_void,
+            value: *const std::ffi::c_void,
+        ) -> i32;
+    }
+
+    fn set_sets_cursor_in_background() {
+        unsafe {
+            let conn = _CGSDefaultConnection();
+            let key_cfstring = CFString::new("SetsCursorInBackground");
+            let key_ptr = key_cfstring.as_concrete_TypeRef() as *const std::ffi::c_void;
+            let value_ptr = kCFBooleanTrue as *const std::ffi::c_void;
+            let result = CGSSetConnectionProperty(conn, conn, key_ptr, value_ptr);
+            if result != 0 {
+                eprintln!("CGSSetConnectionProperty 调用失败，返回值: {}", result);
+            } else {
+                println!("成功设置 SetsCursorInBackground 属性");
+            }
+        }
+    }
 
     pub fn hide_cursor() {
+        INIT.call_once(|| set_sets_cursor_in_background());
         unsafe {
             CGDisplayHideCursor(CGMainDisplayID());
         }
     }
     pub fn show_cursor() {
+        INIT.call_once(|| set_sets_cursor_in_background());
         unsafe {
             CGDisplayShowCursor(CGMainDisplayID());
         }

@@ -1,12 +1,11 @@
 <script setup lang="ts">
-import { type Ref, ref } from 'vue'
+import { ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core';
 import { message } from '@tauri-apps/plugin-dialog';
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { Input } from '@/components/ui/input'
 import { ScrollArea } from '@/components/ui/scroll-area'
-import { MapPinHouse } from 'lucide-vue-next';
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import {
   NumberField,
