@@ -1,4 +1,5 @@
-use crate::logic::{hide_cursor, show_cursor, MousePos};
+use crate::logic::{move_cursor_to, MousePos, MouseDelta};
+use crate::platform::{hide_cursor, show_cursor};
 use enigo::*;
 use rdev::display_size;
 use rdev::{listen, EventType};
@@ -51,8 +52,6 @@ pub fn start_mouse_client(port: u16) {
                             Ok(l) => l,
                             Err(_) => break,
                         };
-                        #[derive(serde::Deserialize)]
-                        struct MouseDelta { dx: i32, dy: i32 }
                         match serde_json::from_str::<MouseDelta>(&line) {
                             Ok(delta) => {
                                 cur_x += delta.dx;
@@ -60,7 +59,7 @@ pub fn start_mouse_client(port: u16) {
                                 enigo.mouse_move_to(cur_x, cur_y);
 
                                 // 新增：到达左边缘时通知服务端释放
-                                if cur_x <= 0 {
+                                if cur_x <= 1 {
                                     let _ = stream.write_all(b"RELEASE\n");
                                     println!("到达左边缘，已通知服务端释放控制权");
                                 }
@@ -125,28 +124,18 @@ pub fn start_mouse_server(ip: String, port: u16) {
 
         // 鼠标监听线程，更新位置和共享状态
         thread::spawn(move || {
-            let mut enigo = Enigo::new();
-
             let callback = move |event: rdev::Event| {
                 if let EventType::MouseMove { x, y } = event.event_type {
                     let mut pos = pos_clone.lock().unwrap();
                     let mut sharing = is_sharing_clone.lock().unwrap();
 
-                    // 判断是否到达右边缘
-                    if x >= (screen_width as f64 - 1.0) {
-                        if !*sharing {
-                            println!("进入共享状态，隐藏光标并置于中心");
-                            hide_cursor();
-                            enigo.mouse_move_to(center_x, center_y);
-                            *sharing = true;
-                            *pos = (center_x, center_y);
-                        }
-                    } else if x < screen_width as f64 - 1.0 {
-                        if *sharing {
-                            println!("退出共享状态，恢复光标");
-                            show_cursor();
-                            *sharing = false;
-                        }
+                    // 只有未共享且到达右边缘时才进入共享
+                    if x >= (screen_width as f64 - 1.0) && !*sharing {
+                        println!("进入共享状态，隐藏光标并置于中心");
+                        hide_cursor();
+                        move_cursor_to(center_x, center_y);
+                        *sharing = true;
+                        *pos = (center_x, center_y);
                     }
 
                     // 共享状态下，计算相对移动并重置鼠标
@@ -154,14 +143,14 @@ pub fn start_mouse_server(ip: String, port: u16) {
                         let dx = x as i32 - center_x;
                         let dy = y as i32 - center_y;
                         if dx != 0 || dy != 0 {
-                            // 存储dx/dy，供主循环发送
+                            println!("鼠标相对移动: dx={}, dy={}", dx, dy);
                             let mut d = delta_clone.lock().unwrap();
                             *d = (dx, dy);
-                            // 重置本机鼠标到中心
-                            enigo.mouse_move_to(center_x, center_y);
+                            move_cursor_to(center_x, center_y);
                             *pos = (center_x, center_y);
                         }
                     }
+                    // 注意：不再因为离开右边缘自动退出共享
                 }
             };
             listen(callback).unwrap();
@@ -177,12 +166,13 @@ pub fn start_mouse_server(ip: String, port: u16) {
             match TcpStream::connect_timeout(&(ip_addr, port).into(), Duration::from_secs(2)) {
                 Ok(mut stream) => {
                     println!("已连接到服务器");
-                    let mut last_sharing = false;
                     let mut buf_reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut last_sharing = false;
 
                     while *is_running.lock().unwrap() {
                         let sharing = *is_sharing.lock().unwrap();
-                        // 只在状态切换时调用隐藏/显示光标
+
+                        // 只在进入共享时隐藏光标，收到RELEASE时恢复
                         if sharing && !last_sharing {
                             println!("调用 mac_cursor::hide_cursor()");
                             hide_cursor();
@@ -194,6 +184,9 @@ pub fn start_mouse_server(ip: String, port: u16) {
 
                         // 共享状态下发送dx/dy
                         if sharing {
+                            // 持续锁定光标在中心
+                            move_cursor_to(center_x, center_y);
+
                             let (dx, dy) = {
                                 let mut d = delta.lock().unwrap();
                                 let v = *d;
@@ -209,7 +202,7 @@ pub fn start_mouse_server(ip: String, port: u16) {
                             }
                         }
 
-                        // 新增：检查客户端是否发来释放信号
+                        // 只在收到RELEASE时退出共享
                         let mut buf = String::new();
                         if let Ok(n) = buf_reader.read_line(&mut buf) {
                             if n > 0 && buf.trim() == "RELEASE" {
