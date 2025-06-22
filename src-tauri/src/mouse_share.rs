@@ -209,6 +209,7 @@ pub fn start_mouse_server(ip: String, port: u16) {
                                 let mut sharing = is_sharing.lock().unwrap();
                                 *sharing = false;
                                 show_cursor();
+                                last_sharing = false; // <--- 关键：同步last_sharing状态
                                 println!("收到客户端释放信号，恢复本机光标");
                             }
                         }
