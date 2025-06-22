@@ -1,19 +1,13 @@
+use crate::logic::{hide_cursor, show_cursor, MousePos};
 use enigo::*;
 use rdev::display_size;
 use rdev::{listen, EventType};
-use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-
-#[derive(Serialize, Deserialize)]
-struct MousePos {
-    x: i32,
-    y: i32,
-}
 
 lazy_static::lazy_static! {
     static ref IS_RUNNING: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
@@ -117,19 +111,15 @@ pub fn start_mouse_server(ip: String, port: u16) {
                     let mut last_sharing = false;
                     while *is_running.lock().unwrap() {
                         let sharing = *is_sharing.lock().unwrap();
+                        println!("上次共享状态: {}", last_sharing);
+                        println!("当前共享状态: {}", sharing);
                         // 只在状态切换时调用隐藏/显示光标
                         if sharing && !last_sharing {
                             println!("调用 mac_cursor::hide_cursor()");
-                            #[cfg(target_os = "macos")]
-                            mac_cursor::hide_cursor();
-                            #[cfg(target_os = "windows")]
-                            win_cursor::hide_cursor();
+                            hide_cursor();
                         } else if !sharing && last_sharing {
                             println!("调用 mac_cursor::show_cursor()");
-                            #[cfg(target_os = "macos")]
-                            mac_cursor::show_cursor();
-                            #[cfg(target_os = "windows")]
-                            win_cursor::show_cursor();
+                            show_cursor();
                         }
                         last_sharing = sharing;
 
