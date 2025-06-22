@@ -1,6 +1,4 @@
-use crate::logic::{move_cursor_to, MousePos, MouseDelta};
-use crate::platform::{hide_cursor, show_cursor};
-use enigo::*;
+use crate::logic::{hide_cursor, move_cursor_to, show_cursor, MouseDelta};
 use rdev::display_size;
 use rdev::{listen, EventType};
 use std::io::Write;
@@ -36,16 +34,14 @@ pub fn start_mouse_client(port: u16) {
             match listener.accept() {
                 Ok((mut stream, addr)) => {
                     println!("客户端已连接: {}", addr);
-                    let mut enigo = Enigo::new();
                     let reader = BufReader::new(stream.try_clone().unwrap());
 
                     // 获取当前鼠标初始位置
                     let (mut cur_x, mut cur_y) = get_current_mouse_position();
 
                     // 确保客户端光标显示
+                    println!("[客户端] 调用 show_cursor()");
                     show_cursor();
-
-                    let (screen_width, _) = display_size().unwrap_or((1920, 1080));
 
                     for line in reader.lines() {
                         let line = match line {
@@ -56,22 +52,28 @@ pub fn start_mouse_client(port: u16) {
                             Ok(delta) => {
                                 cur_x += delta.dx;
                                 cur_y += delta.dy;
-                                enigo.mouse_move_to(cur_x, cur_y);
+                                println!(
+                                    "[客户端] 收到 dx={}, dy={}，移动到 ({}, {})",
+                                    delta.dx, delta.dy, cur_x, cur_y
+                                );
+                                move_cursor_to(cur_x, cur_y);
 
                                 // 新增：到达左边缘时通知服务端释放
                                 if cur_x <= 1 {
                                     let _ = stream.write_all(b"RELEASE\n");
-                                    println!("到达左边缘，已通知服务端释放控制权");
+                                    println!("[客户端] 到达左边缘，已通知服务端释放控制权");
                                 }
                             }
-                            Err(e) => println!("解析数据错误: {}", e),
+                            Err(e) => println!("[客户端] 解析数据错误: {}", e),
                         }
                         if !*is_running.lock().unwrap() {
+                            println!("[客户端] 共享已停止，退出循环");
                             break;
                         }
                     }
+                    println!("[客户端] 连接断开或循环结束");
                 }
-                Err(e) => println!("接受连接错误: {}", e),
+                Err(e) => println!("[客户端] 接受连接错误: {}", e),
             }
         }
     });
@@ -79,25 +81,10 @@ pub fn start_mouse_client(port: u16) {
 
 // 获取当前鼠标位置的辅助函数
 fn get_current_mouse_position() -> (i32, i32) {
-    use rdev::listen;
-    use std::sync::{Arc, Mutex};
-    let pos = Arc::new(Mutex::new((0, 0)));
-    let pos_clone = Arc::clone(&pos);
-
-    // 只监听一次鼠标移动事件
-    let _ = std::thread::spawn(move || {
-        let cb = move |event: rdev::Event| {
-            if let rdev::EventType::MouseMove { x, y } = event.event_type {
-                let mut p = pos_clone.lock().unwrap();
-                *p = (x as i32, y as i32);
-            }
-        };
-        let _ = listen(cb);
-    })
-    .join();
-
-    let p = pos.lock().unwrap();
-    *p
+    let (screen_width, screen_height) = display_size().unwrap_or((1920, 1080));
+    let x = 2;
+    let y = (screen_height / 2) as i32;
+    (x, y)
 }
 
 #[tauri::command]
@@ -194,6 +181,7 @@ pub fn start_mouse_server(ip: String, port: u16) {
                                 v
                             };
                             if dx != 0 || dy != 0 {
+                                println!("[服务端] 发送 dx={}, dy={}", dx, dy); // 新增日志
                                 let msg = format!("{{\"dx\":{},\"dy\":{}}}\n", dx, dy);
                                 if let Err(e) = stream.write_all(msg.as_bytes()) {
                                     println!("发送数据错误: {}", e);
