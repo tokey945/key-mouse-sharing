@@ -1,3 +1,4 @@
+use enigo::MouseControllable;
 use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MousePos {
@@ -18,7 +19,8 @@ pub fn show_cursor() {
     crate::platform::show_cursor();
 }
 pub fn move_cursor_to(dx: i32, dy: i32) {
-    crate::platform::move_cursor_to(dx, dy);
+    let mut enigo = enigo::Enigo::new();
+    enigo.mouse_move_to(dx, dy);
 }
 
 pub fn simulate_button_down(button: &str) {

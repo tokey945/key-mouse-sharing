@@ -4,6 +4,6 @@ mod mac;
 mod win;
 
 #[cfg(target_os = "macos")]
-pub use mac::{hide_cursor, move_cursor_to, show_cursor};
+pub use mac::{hide_cursor, show_cursor};
 #[cfg(target_os = "windows")]
-pub use win::{hide_cursor, move_cursor_to, show_cursor};
+pub use win::{hide_cursor, show_cursor};
