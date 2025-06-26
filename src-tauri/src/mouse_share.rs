@@ -1,12 +1,29 @@
-use crate::logic::{hide_cursor, move_cursor_to, show_cursor, MouseDelta};
+use crate::logic::{
+    hide_cursor, move_cursor_to, show_cursor, simulate_button_down, simulate_button_up,
+    simulate_wheel,
+};
 use rdev::display_size;
 use rdev::{listen, EventType};
+use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum MouseEventKind {
+    Move { dx: i32, dy: i32 },
+    ButtonDown { button: String },
+    ButtonUp { button: String },
+    Wheel { delta: i32 },
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct MouseEvent {
+    pub kind: MouseEventKind,
+}
 
 lazy_static::lazy_static! {
     static ref IS_RUNNING: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
@@ -51,23 +68,35 @@ pub fn start_mouse_client(port: u16) {
                             Ok(l) => l,
                             Err(_) => break,
                         };
-                        match serde_json::from_str::<MouseDelta>(&line) {
-                            Ok(delta) => {
-                                cur_x = (cur_x + delta.dx).clamp(0, max_x);
-                                cur_y = (cur_y + delta.dy).clamp(0, max_y);
-                                println!(
-                                    "[客户端] 收到 dx={}, dy={}，移动到 ({}, {})",
-                                    delta.dx, delta.dy, cur_x, cur_y
-                                );
-                                show_cursor();
-                                move_cursor_to(cur_x, cur_y);
-
-                                // 新增：到达左边缘时通知服务端释放
-                                if cur_x <= 1 {
-                                    let _ = stream.write_all(b"RELEASE\n");
-                                    println!("[客户端] 到达左边缘，已通知服务端释放控制权");
+                        match serde_json::from_str::<MouseEvent>(&line) {
+                            Ok(evt) => match evt.kind {
+                                MouseEventKind::Move { dx, dy } => {
+                                    cur_x = (cur_x + dx).clamp(0, max_x);
+                                    cur_y = (cur_y + dy).clamp(0, max_y);
+                                    println!(
+                                        "[客户端] 收到 Move dx={}, dy={}，移动到 ({}, {})",
+                                        dx, dy, cur_x, cur_y
+                                    );
+                                    move_cursor_to(cur_x, cur_y);
+                                    // 到达左边缘时通知服务端释放
+                                    if cur_x <= 1 {
+                                        let _ = stream.write_all(b"RELEASE\n");
+                                        println!("[客户端] 到达左边缘，已通知服务端释放控制权");
+                                    }
                                 }
-                            }
+                                MouseEventKind::ButtonDown { button } => {
+                                    println!("[客户端] 收到 ButtonDown: {}", button);
+                                    simulate_button_down(&button);
+                                }
+                                MouseEventKind::ButtonUp { button } => {
+                                    println!("[客户端] 收到 ButtonUp: {}", button);
+                                    simulate_button_up(&button);
+                                }
+                                MouseEventKind::Wheel { delta } => {
+                                    println!("[客户端] 收到 Wheel: {}", delta);
+                                    simulate_wheel(delta);
+                                }
+                            },
                             Err(e) => println!("[客户端] 解析数据错误: {}", e),
                         }
                         if !*is_running.lock().unwrap() {
@@ -86,7 +115,7 @@ pub fn start_mouse_client(port: u16) {
 // 获取当前鼠标位置的辅助函数
 fn get_current_mouse_position() -> (i32, i32) {
     let (screen_width, screen_height) = display_size().unwrap_or((1920, 1080));
-    let x = 2;
+    let x = (screen_width / 2) as i32;
     let y = (screen_height / 2) as i32;
     (x, y)
 }
@@ -107,15 +136,16 @@ pub fn start_mouse_server(ip: String, port: u16) {
         let is_sharing_clone = Arc::clone(&is_sharing);
 
         // 用于线程间传递dx/dy
-        let delta = Arc::new(Mutex::new((0, 0)));
-        let delta_clone = Arc::clone(&delta);
+        let mouse_event_queue = Arc::new(Mutex::new(Vec::new()));
+        let mouse_event_queue_clone = Arc::clone(&mouse_event_queue);
 
         // 鼠标监听线程，更新位置和共享状态
         thread::spawn(move || {
             let callback = move |event: rdev::Event| {
-                if let EventType::MouseMove { x, y } = event.event_type {
-                    let mut sharing = is_sharing_clone.lock().unwrap();
+                let mut sharing = is_sharing_clone.lock().unwrap();
 
+                // 先判断是否进入共享条件
+                if let EventType::MouseMove { x, y } = event.event_type {
                     // 只有未共享且到达右边缘时才进入共享
                     if x >= (screen_width as f64 - 1.0) && !*sharing {
                         println!("进入共享状态，隐藏光标并置于中心");
@@ -123,16 +153,50 @@ pub fn start_mouse_server(ip: String, port: u16) {
                         move_cursor_to(center_x, center_y);
                         *sharing = true;
                     }
+                };
 
-                    // 共享状态下，计算相对移动并重置鼠标
-                    if *sharing {
-                        let dx = x as i32 - center_x;
-                        let dy = y as i32 - center_y;
-                        if dx != 0 || dy != 0 {
-                            let mut d = delta_clone.lock().unwrap();
-                            *d = (dx, dy);
-                            move_cursor_to(center_x, center_y);
+                // 共享状态下，计算相对移动并重置鼠标
+                if *sharing {
+                    let mut mouse_event_queue = mouse_event_queue_clone.lock().unwrap();
+
+                    match event.event_type {
+                        EventType::MouseMove { x, y } => {
+                            let dx = x as i32 - center_x;
+                            let dy = y as i32 - center_y;
+                            if dx != 0 || dy != 0 {
+                                mouse_event_queue.push(MouseEvent {
+                                    kind: MouseEventKind::Move { dx, dy },
+                                });
+
+                                move_cursor_to(center_x, center_y);
+                            }
                         }
+
+                        EventType::ButtonPress(btn) => {
+                            mouse_event_queue.push(MouseEvent {
+                                kind: MouseEventKind::ButtonDown {
+                                    button: format!("{:?}", btn),
+                                },
+                            });
+                        }
+
+                        EventType::ButtonRelease(btn) => {
+                            mouse_event_queue.push(MouseEvent {
+                                kind: MouseEventKind::ButtonUp {
+                                    button: format!("{:?}", btn),
+                                },
+                            });
+                        }
+
+                        EventType::Wheel { delta_y, .. } => {
+                            mouse_event_queue.push(MouseEvent {
+                                kind: MouseEventKind::Wheel {
+                                    delta: delta_y as i32,
+                                },
+                            });
+                        }
+
+                        _ => {}
                     }
                 }
             };
@@ -182,23 +246,15 @@ pub fn start_mouse_server(ip: String, port: u16) {
                         }
                         last_sharing = sharing;
 
-                        println!("当前共享状态: {}", sharing);
                         // 共享状态下发送dx/dy
                         if sharing {
                             // 持续锁定光标在中心
+                            println!("move_cursor_to({}, {})", center_x, center_y);
                             move_cursor_to(center_x, center_y);
+                            let mut queue = mouse_event_queue.lock().unwrap();
 
-                            let (dx, dy) = {
-                                let mut d = delta.lock().unwrap();
-                                let v = *d;
-                                *d = (0, 0); // 发送后清零
-                                v
-                            };
-                            println!("x:{}, y:{}", &dx, &dy);
-
-                            if dx != 0 || dy != 0 {
-                                println!("[服务端] 发送 dx={}, dy={}", dx, dy); // 新增日志
-                                let msg = format!("{{\"dx\":{},\"dy\":{}}}\n", dx, dy);
+                            while let Some(evt) = queue.pop() {
+                                let msg = serde_json::to_string(&evt).unwrap() + "\n";
                                 if let Err(e) = stream.write_all(msg.as_bytes()) {
                                     println!("发送数据错误: {}", e);
                                     break;

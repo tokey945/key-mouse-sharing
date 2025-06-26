@@ -20,3 +20,32 @@ pub fn show_cursor() {
 pub fn move_cursor_to(dx: i32, dy: i32) {
     crate::platform::move_cursor_to(dx, dy);
 }
+
+pub fn simulate_button_down(button: &str) {
+    // 这里用 enigo 举例
+    use enigo::{Enigo, MouseButton, MouseControllable};
+    let mut enigo = Enigo::new();
+    match button {
+        "Left" | "Button1" => enigo.mouse_down(MouseButton::Left),
+        "Right" | "Button2" => enigo.mouse_down(MouseButton::Right),
+        "Middle" | "Button3" => enigo.mouse_down(MouseButton::Middle),
+        _ => {}
+    }
+}
+
+pub fn simulate_button_up(button: &str) {
+    use enigo::{Enigo, MouseButton, MouseControllable};
+    let mut enigo = Enigo::new();
+    match button {
+        "Left" | "Button1" => enigo.mouse_up(MouseButton::Left),
+        "Right" | "Button2" => enigo.mouse_up(MouseButton::Right),
+        "Middle" | "Button3" => enigo.mouse_up(MouseButton::Middle),
+        _ => {}
+    }
+}
+
+pub fn simulate_wheel(delta: i32) {
+    use enigo::{Enigo, MouseControllable};
+    let mut enigo = Enigo::new();
+    enigo.mouse_scroll_y(delta);
+}
