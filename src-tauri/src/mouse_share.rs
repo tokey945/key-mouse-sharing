@@ -41,7 +41,10 @@ pub fn start_mouse_client(port: u16) {
 
                     // 确保客户端光标显示
                     println!("[客户端] 调用 show_cursor()");
-                    show_cursor();
+                    let (screen_width, screen_height) = display_size().unwrap_or((1920, 1080));
+
+                    let max_x = screen_width as i32 - 1;
+                    let max_y = screen_height as i32 - 1;
 
                     for line in reader.lines() {
                         let line = match line {
@@ -50,12 +53,13 @@ pub fn start_mouse_client(port: u16) {
                         };
                         match serde_json::from_str::<MouseDelta>(&line) {
                             Ok(delta) => {
-                                cur_x += delta.dx;
-                                cur_y += delta.dy;
+                                cur_x = (cur_x + delta.dx).clamp(0, max_x);
+                                cur_y = (cur_y + delta.dy).clamp(0, max_y);
                                 println!(
                                     "[客户端] 收到 dx={}, dy={}，移动到 ({}, {})",
                                     delta.dx, delta.dy, cur_x, cur_y
                                 );
+                                show_cursor();
                                 move_cursor_to(cur_x, cur_y);
 
                                 // 新增：到达左边缘时通知服务端释放
@@ -99,9 +103,6 @@ pub fn start_mouse_server(ip: String, port: u16) {
         let center_x = (screen_width / 2) as i32;
         let center_y = (screen_height / 2) as i32;
 
-        let position = Arc::new(Mutex::new((center_x, center_y)));
-        let pos_clone = Arc::clone(&position);
-
         let is_sharing = Arc::new(Mutex::new(false));
         let is_sharing_clone = Arc::clone(&is_sharing);
 
@@ -113,7 +114,6 @@ pub fn start_mouse_server(ip: String, port: u16) {
         thread::spawn(move || {
             let callback = move |event: rdev::Event| {
                 if let EventType::MouseMove { x, y } = event.event_type {
-                    let mut pos = pos_clone.lock().unwrap();
                     let mut sharing = is_sharing_clone.lock().unwrap();
 
                     // 只有未共享且到达右边缘时才进入共享
@@ -122,7 +122,6 @@ pub fn start_mouse_server(ip: String, port: u16) {
                         hide_cursor();
                         move_cursor_to(center_x, center_y);
                         *sharing = true;
-                        *pos = (center_x, center_y);
                     }
 
                     // 共享状态下，计算相对移动并重置鼠标
@@ -130,14 +129,11 @@ pub fn start_mouse_server(ip: String, port: u16) {
                         let dx = x as i32 - center_x;
                         let dy = y as i32 - center_y;
                         if dx != 0 || dy != 0 {
-                            println!("鼠标相对移动: dx={}, dy={}", dx, dy);
                             let mut d = delta_clone.lock().unwrap();
                             *d = (dx, dy);
                             move_cursor_to(center_x, center_y);
-                            *pos = (center_x, center_y);
                         }
                     }
-                    // 注意：不再因为离开右边缘自动退出共享
                 }
             };
             listen(callback).unwrap();
@@ -153,22 +149,40 @@ pub fn start_mouse_server(ip: String, port: u16) {
             match TcpStream::connect_timeout(&(ip_addr, port).into(), Duration::from_secs(2)) {
                 Ok(mut stream) => {
                     println!("已连接到服务器");
+
+                    let is_sharing_recv = Arc::clone(&is_sharing);
                     let mut buf_reader = BufReader::new(stream.try_clone().unwrap());
+                    thread::spawn(move || loop {
+                        let mut buf = String::new();
+                        match buf_reader.read_line(&mut buf) {
+                            Ok(n) => {
+                                if n > 0 && buf.trim() == "RELEASE" {
+                                    let mut sharing = is_sharing_recv.lock().unwrap();
+                                    *sharing = false;
+                                    show_cursor();
+                                    println!("收到客户端释放信号，恢复本机光标");
+                                }
+                            }
+                            Err(e) => {
+                                println!("接收客户端消息出错: {}", e);
+                                break;
+                            }
+                        }
+                    });
+
                     let mut last_sharing = false;
 
                     while *is_running.lock().unwrap() {
                         let sharing = *is_sharing.lock().unwrap();
 
                         // 只在进入共享时隐藏光标，收到RELEASE时恢复
-                        if sharing && !last_sharing {
-                            println!("调用 mac_cursor::hide_cursor()");
-                            hide_cursor();
-                        } else if !sharing && last_sharing {
+                        if !sharing && last_sharing {
                             println!("调用 mac_cursor::show_cursor()");
                             show_cursor();
                         }
                         last_sharing = sharing;
 
+                        println!("当前共享状态: {}", sharing);
                         // 共享状态下发送dx/dy
                         if sharing {
                             // 持续锁定光标在中心
@@ -180,6 +194,8 @@ pub fn start_mouse_server(ip: String, port: u16) {
                                 *d = (0, 0); // 发送后清零
                                 v
                             };
+                            println!("x:{}, y:{}", &dx, &dy);
+
                             if dx != 0 || dy != 0 {
                                 println!("[服务端] 发送 dx={}, dy={}", dx, dy); // 新增日志
                                 let msg = format!("{{\"dx\":{},\"dy\":{}}}\n", dx, dy);
@@ -187,18 +203,6 @@ pub fn start_mouse_server(ip: String, port: u16) {
                                     println!("发送数据错误: {}", e);
                                     break;
                                 }
-                            }
-                        }
-
-                        // 只在收到RELEASE时退出共享
-                        let mut buf = String::new();
-                        if let Ok(n) = buf_reader.read_line(&mut buf) {
-                            if n > 0 && buf.trim() == "RELEASE" {
-                                let mut sharing = is_sharing.lock().unwrap();
-                                *sharing = false;
-                                show_cursor();
-                                last_sharing = false; // <--- 关键：同步last_sharing状态
-                                println!("收到客户端释放信号，恢复本机光标");
                             }
                         }
 

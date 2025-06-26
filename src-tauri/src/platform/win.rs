@@ -1,42 +1,134 @@
-#[cfg(target_os = "windows")]
-use winapi::um::winuser::{SetSystemCursor, LoadImageW, OCR_NORMAL, SPI_SETCURSORS, SystemParametersInfoW, LR_LOADFROMFILE, IMAGE_CURSOR};
-#[cfg(target_os = "windows")]
-use winapi::shared::windef::HCURSOR;
-#[cfg(target_os = "windows")]
+use winapi::um::winuser::{
+    SendInput, SetCursorPos, SetCursor, LoadCursorW,
+    INPUT, INPUT_MOUSE, MOUSEINPUT, MOUSEEVENTF_MOVE,
+    IDC_ARROW, ShowCursor, SetSystemCursor,
+    SystemParametersInfoW, SPI_SETCURSORS, GetCursorPos,
+    MOUSEEVENTF_MOVE_NOCOALESCE
+};
+use winapi::shared::windef::HCURSOR, POINT;
 use std::ptr::null_mut;
-#[cfg(target_os = "windows")]
-use std::ffi::OsStr;
-#[cfg(target_os = "windows")]
-use std::os::windows::ffi::OsStrExt;
+use std::sync::Once;
 
-#[cfg(target_os = "windows")]
-fn wide_null(s: &str) -> Vec<u16> {
-    OsStr::new(s).encode_wide().chain(Some(0)).collect()
+static INIT: Once = Once::new();
+static mut CURSOR_MANAGER: Option<CursorManager> = None;
+
+struct CursorManager {
+    original_cursor: Option<HCURSOR>,
+}
+
+impl CursorManager {
+    fn new() -> Self {
+        Self {
+            original_cursor: None,
+        }
+    }
+
+    fn ensure_visible(&mut self) {
+        unsafe {
+            // 创建鼠标移动事件
+            let mut input = INPUT {
+                type_: INPUT_MOUSE,
+                u: std::mem::zeroed(),
+            };
+            
+            *input.u.mi_mut() = MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE,
+                time: 0,
+                dwExtraInfo: 0,
+            };
+
+            SendInput(1, &mut input, std::mem::size_of::<INPUT>() as i32);
+            
+            // 设置系统光标
+            let cursor = LoadCursorW(null_mut(), IDC_ARROW as *const u16);
+            if !cursor.is_null() {
+                SetCursor(cursor);
+                if self.original_cursor.is_none() {
+                    self.original_cursor = Some(cursor);
+                }
+            }
+        }
+    }
+}
+
+fn get_cursor_manager() -> &'static mut CursorManager {
+    unsafe {
+        if CURSOR_MANAGER.is_none() {
+            INIT.call_once(|| {
+                CURSOR_MANAGER = Some(CursorManager::new());
+            });
+        }
+        CURSOR_MANAGER.as_mut().unwrap()
+    }
 }
 
 #[cfg(target_os = "windows")]
 pub fn hide_cursor() {
     unsafe {
-        // 加载透明光标
-        let path = wide_null("src/platform/blank.cur"); // 路径根据实际情况调整
-        let hcursor: HCURSOR = LoadImageW(
-            null_mut(),
-            path.as_ptr(),
-            IMAGE_CURSOR,
-            0,
-            0,
-            LR_LOADFROMFILE,
-        ) as HCURSOR;
-        if !hcursor.is_null() {
-            SetSystemCursor(hcursor, OCR_NORMAL);
-        }
+        // 隐藏光标
+        while ShowCursor(0) >= 0 {}
     }
 }
 
 #[cfg(target_os = "windows")]
 pub fn show_cursor() {
     unsafe {
-        // 恢复系统默认光标
-        SystemParametersInfoW(SPI_SETCURSORS, 0, null_mut(), 0);
+        get_cursor_manager().ensure_visible();
+        
+        // 恢复系统光标
+        SystemParametersInfoW(
+            SPI_SETCURSORS,
+            0,
+            null_mut(),
+            0
+        );
+        
+        // 确保光标显示
+        while ShowCursor(1) < 0 {}
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn move_cursor_to(dx: i32, dy: i32) {
+    unsafe {
+        // 获取当前鼠标位置
+        let mut current_pos = POINT { x: 0, y: 0 };
+        if GetCursorPos(&mut current_pos) != 0 {
+            // 计算新位置
+            let new_x = current_pos.x + dx;
+            let new_y = current_pos.y + dy;
+            
+            // 发送相对移动事件
+            let mut input = INPUT {
+                type_: INPUT_MOUSE,
+                u: std::mem::zeroed(),
+            };
+            
+            *input.u.mi_mut() = MOUSEINPUT {
+                dx,
+                dy,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE,
+                time: 0,
+                dwExtraInfo: 0,
+            };
+
+            SendInput(1, &mut input, std::mem::size_of::<INPUT>() as i32);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn get_mouse_position() -> (i32, i32) {
+    unsafe {
+        let mut pos = POINT { x: 0, y: 0 };
+        if GetCursorPos(&mut pos) != 0 {
+            (pos.x, pos.y)
+        } else {
+            (0, 0)
+        }
     }
 }

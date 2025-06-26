@@ -1,14 +1,15 @@
 #[cfg(target_os = "macos")]
-use core_graphics::display::{CGDisplayHideCursor, CGDisplayShowCursor, CGMainDisplayID};
-#[cfg(target_os = "macos")]
-use std::sync::Once;
-#[cfg(target_os = "macos")]
 use core_foundation::base::TCFType;
 #[cfg(target_os = "macos")]
 use core_foundation::boolean::kCFBooleanTrue;
 #[cfg(target_os = "macos")]
 use core_foundation::string::CFString;
-
+#[cfg(target_os = "macos")]
+use core_graphics::display::{CGDisplayHideCursor, CGDisplayShowCursor, CGMainDisplayID};
+#[cfg(target_os = "macos")]
+use enigo::MouseControllable;
+#[cfg(target_os = "macos")]
+use std::sync::Once;
 #[cfg(target_os = "macos")]
 static INIT: Once = Once::new();
 
@@ -52,4 +53,10 @@ pub fn show_cursor() {
     unsafe {
         CGDisplayShowCursor(CGMainDisplayID());
     }
+}
+
+#[cfg(target_os = "macos")]
+pub fn move_cursor_to(x: i32, y: i32) {
+    let mut enigo = enigo::Enigo::new();
+    enigo.mouse_move_to(x, y);
 }

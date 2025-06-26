@@ -1,4 +1,3 @@
-use enigo::MouseControllable;
 use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MousePos {
@@ -18,8 +17,6 @@ pub fn hide_cursor() {
 pub fn show_cursor() {
     crate::platform::show_cursor();
 }
-
-pub fn move_cursor_to(x: i32, y: i32) {
-    let mut enigo = enigo::Enigo::new();
-    enigo.mouse_move_to(x, y);
+pub fn move_cursor_to(dx: i32, dy: i32) {
+    crate::platform::move_cursor_to(dx, dy);
 }
