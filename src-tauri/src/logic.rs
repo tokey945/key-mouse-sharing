@@ -51,3 +51,23 @@ pub fn simulate_wheel(delta: i32) {
     let mut enigo = Enigo::new();
     enigo.mouse_scroll_y(delta);
 }
+
+pub fn simulate_key_down(key: &str) {
+    use enigo::{Enigo, Key, KeyboardControllable};
+    let mut enigo = Enigo::new();
+    if let Some(k) = str_to_enigo_key(key) {
+        enigo.key_down(k);
+    }
+}
+
+pub fn simulate_key_up(key: &str) {
+    use enigo::{Enigo, Key, KeyboardControllable};
+    let mut enigo = Enigo::new();
+    if let Some(k) = str_to_enigo_key(key) {
+        enigo.key_up(k);
+    }
+}
+
+fn str_to_enigo_key(key: &str) -> Option<enigo::Key> {
+    crate::platform::str_to_enigo_key(key)
+}

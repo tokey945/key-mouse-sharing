@@ -7,3 +7,8 @@ mod win;
 pub use mac::{hide_cursor, show_cursor};
 #[cfg(target_os = "windows")]
 pub use win::{hide_cursor, show_cursor};
+
+#[cfg(target_os = "macos")]
+pub use crate::platform::mac::str_to_enigo_key;
+#[cfg(target_os = "windows")]
+pub use crate::platform::win::str_to_enigo_key;

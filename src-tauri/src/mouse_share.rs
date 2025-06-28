@@ -1,6 +1,6 @@
 use crate::logic::{
     hide_cursor, move_cursor_to, show_cursor, simulate_button_down, simulate_button_up,
-    simulate_wheel,
+    simulate_key_down, simulate_key_up, simulate_wheel,
 };
 use rdev::display_size;
 use rdev::{listen, EventType};
@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+// 鼠标事件监听
 #[derive(Serialize, Deserialize, Debug)]
 pub enum MouseEventKind {
     Move { dx: i32, dy: i32 },
@@ -23,6 +24,18 @@ pub enum MouseEventKind {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct MouseEvent {
     pub kind: MouseEventKind,
+}
+
+// 键盘事件监听线程
+#[derive(Serialize, Deserialize, Debug)]
+pub enum KeyEventKind {
+    KeyDown { key: String },
+    KeyUp { key: String },
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct KeyEvent {
+    pub kind: KeyEventKind,
 }
 
 lazy_static::lazy_static! {
@@ -99,6 +112,21 @@ pub fn start_mouse_client(port: u16) {
                             },
                             Err(e) => println!("[客户端] 解析数据错误: {}", e),
                         }
+
+                        match serde_json::from_str::<KeyEvent>(&line) {
+                            Ok(evt) => match evt.kind {
+                                KeyEventKind::KeyDown { key } => {
+                                    println!("[客户端] 收到 KeyDown: {}", key);
+                                    simulate_key_down(&key);
+                                }
+                                KeyEventKind::KeyUp { key } => {
+                                    println!("[客户端] 收到 KeyUp: {}", key);
+                                    simulate_key_up(&key);
+                                }
+                            },
+                            Err(e) => println!("[客户端] 解析键盘数据错误: {}", e),
+                        }
+
                         if !*is_running.lock().unwrap() {
                             println!("[客户端] 共享已停止，退出循环");
                             break;
@@ -138,7 +166,8 @@ pub fn start_mouse_server(ip: String, port: u16) {
         // 用于线程间传递dx/dy
         let mouse_event_queue = Arc::new(Mutex::new(Vec::new()));
         let mouse_event_queue_clone = Arc::clone(&mouse_event_queue);
-
+        let key_event_queue = Arc::new(Mutex::new(Vec::new()));
+        let key_event_queue_clone = Arc::clone(&key_event_queue);
         // 鼠标监听线程，更新位置和共享状态
         thread::spawn(move || {
             let callback = move |event: rdev::Event| {
@@ -158,6 +187,7 @@ pub fn start_mouse_server(ip: String, port: u16) {
                 // 共享状态下，计算相对移动并重置鼠标
                 if *sharing {
                     let mut mouse_event_queue = mouse_event_queue_clone.lock().unwrap();
+                    let mut key_event_queue = key_event_queue_clone.lock().unwrap();
 
                     match event.event_type {
                         EventType::MouseMove { x, y } => {
@@ -196,7 +226,21 @@ pub fn start_mouse_server(ip: String, port: u16) {
                             });
                         }
 
-                        _ => {}
+                        EventType::KeyPress(key) => {
+                            key_event_queue.push(KeyEvent {
+                                kind: KeyEventKind::KeyDown {
+                                    key: format!("{:?}", key),
+                                },
+                            });
+                        }
+
+                        EventType::KeyRelease(key) => {
+                            key_event_queue.push(KeyEvent {
+                                kind: KeyEventKind::KeyUp {
+                                    key: format!("{:?}", key),
+                                },
+                            });
+                        }
                     }
                 }
             };
@@ -251,12 +295,21 @@ pub fn start_mouse_server(ip: String, port: u16) {
                             // 持续锁定光标在中心
                             println!("move_cursor_to({}, {})", center_x, center_y);
                             move_cursor_to(center_x, center_y);
-                            let mut queue = mouse_event_queue.lock().unwrap();
+                            let mut mouse_queue = mouse_event_queue.lock().unwrap();
+                            let mut key_queue = key_event_queue.lock().unwrap();
 
-                            while let Some(evt) = queue.pop() {
+                            while let Some(evt) = key_queue.pop() {
                                 let msg = serde_json::to_string(&evt).unwrap() + "\n";
                                 if let Err(e) = stream.write_all(msg.as_bytes()) {
-                                    println!("发送数据错误: {}", e);
+                                    println!("发送键盘数据错误: {}", e);
+                                    break;
+                                }
+                            }
+
+                            while let Some(evt) = mouse_queue.pop() {
+                                let msg = serde_json::to_string(&evt).unwrap() + "\n";
+                                if let Err(e) = stream.write_all(msg.as_bytes()) {
+                                    println!("发送鼠标数据错误: {}", e);
                                     break;
                                 }
                             }
