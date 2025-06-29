@@ -12,7 +12,21 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-// 鼠标事件监听
+// 键鼠事件
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "untagged")]
+enum AnyEvent {
+    MouseEvent(MouseEvent),
+    KeyEvent(KeyEvent),
+}
+
+// 鼠标事件
+#[derive(Serialize, Deserialize, Debug)]
+pub struct MouseEvent {
+    pub kind: MouseEventKind,
+}
+
+// 鼠标事件类型
 #[derive(Serialize, Deserialize, Debug)]
 pub enum MouseEventKind {
     Move { dx: i32, dy: i32 },
@@ -21,23 +35,20 @@ pub enum MouseEventKind {
     Wheel { delta: i32 },
 }
 
+// 键盘事件
 #[derive(Serialize, Deserialize, Debug)]
-pub struct MouseEvent {
-    pub kind: MouseEventKind,
+pub struct KeyEvent {
+    pub kind: KeyEventKind,
 }
 
-// 键盘事件监听线程
+// 键盘事件类型
 #[derive(Serialize, Deserialize, Debug)]
 pub enum KeyEventKind {
     KeyDown { key: String },
     KeyUp { key: String },
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct KeyEvent {
-    pub kind: KeyEventKind,
-}
-
+// 服务端或客户端是否启动运行
 lazy_static::lazy_static! {
     static ref IS_RUNNING: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 }
@@ -66,12 +77,13 @@ pub fn start_mouse_client(port: u16) {
                     println!("客户端已连接: {}", addr);
                     let reader = BufReader::new(stream.try_clone().unwrap());
 
-                    // 获取当前鼠标初始位置
-                    let (mut cur_x, mut cur_y) = get_current_mouse_position();
-
-                    // 确保客户端光标显示
-                    println!("[客户端] 调用 show_cursor()");
+                    // 获取当前默认的鼠标初始位置
                     let (screen_width, screen_height) = display_size().unwrap_or((1920, 1080));
+                    let (mut cur_x, mut cur_y) =
+                        ((screen_width / 2) as i32, (screen_height / 2) as i32);
+
+                    // todo 确保客户端光标显示
+                    println!("[客户端] 调用 show_cursor()");
 
                     let max_x = screen_width as i32 - 1;
                     let max_y = screen_height as i32 - 1;
@@ -81,8 +93,9 @@ pub fn start_mouse_client(port: u16) {
                             Ok(l) => l,
                             Err(_) => break,
                         };
-                        match serde_json::from_str::<MouseEvent>(&line) {
-                            Ok(evt) => match evt.kind {
+
+                        match serde_json::from_str::<AnyEvent>(&line) {
+                            Ok(AnyEvent::MouseEvent(evt)) => match evt.kind {
                                 MouseEventKind::Move { dx, dy } => {
                                     cur_x = (cur_x + dx).clamp(0, max_x);
                                     cur_y = (cur_y + dy).clamp(0, max_y);
@@ -110,11 +123,7 @@ pub fn start_mouse_client(port: u16) {
                                     simulate_wheel(delta);
                                 }
                             },
-                            Err(e) => println!("[客户端] 解析数据错误: {}", e),
-                        }
-
-                        match serde_json::from_str::<KeyEvent>(&line) {
-                            Ok(evt) => match evt.kind {
+                            Ok(AnyEvent::KeyEvent(evt)) => match evt.kind {
                                 KeyEventKind::KeyDown { key } => {
                                     println!("[客户端] 收到 KeyDown: {}", key);
                                     simulate_key_down(&key);
@@ -124,28 +133,21 @@ pub fn start_mouse_client(port: u16) {
                                     simulate_key_up(&key);
                                 }
                             },
-                            Err(e) => println!("[客户端] 解析键盘数据错误: {}", e),
+                            Err(e) => println!("[客户端] 解析数据错误: {}", e),
                         }
 
                         if !*is_running.lock().unwrap() {
-                            println!("[客户端] 共享已停止，退出循环");
+                            println!("[客户端] 共享已运行，退出循环");
                             break;
                         }
                     }
                     println!("[客户端] 连接断开或循环结束");
+                    let _ = stream.write_all(b"RELEASE\n");
                 }
                 Err(e) => println!("[客户端] 接受连接错误: {}", e),
             }
         }
     });
-}
-
-// 获取当前鼠标位置的辅助函数
-fn get_current_mouse_position() -> (i32, i32) {
-    let (screen_width, screen_height) = display_size().unwrap_or((1920, 1080));
-    let x = (screen_width / 2) as i32;
-    let y = (screen_height / 2) as i32;
-    (x, y)
 }
 
 #[tauri::command]
@@ -164,17 +166,15 @@ pub fn start_mouse_server(ip: String, port: u16) {
         let is_sharing_clone = Arc::clone(&is_sharing);
 
         // 用于线程间传递dx/dy
-        let mouse_event_queue = Arc::new(Mutex::new(Vec::new()));
-        let mouse_event_queue_clone = Arc::clone(&mouse_event_queue);
-        let key_event_queue = Arc::new(Mutex::new(Vec::new()));
-        let key_event_queue_clone = Arc::clone(&key_event_queue);
-        // 鼠标监听线程，更新位置和共享状态
+        let event_queue = Arc::new(Mutex::new(Vec::new()));
+        let event_queue_clone = Arc::clone(&event_queue);
+        // 该线程用来监听本地键鼠事件，并判断是否进入共享状态，更新位置和共享状态
         thread::spawn(move || {
             let callback = move |event: rdev::Event| {
                 let mut sharing = is_sharing_clone.lock().unwrap();
 
                 // 先判断是否进入共享条件
-                if let EventType::MouseMove { x, y } = event.event_type {
+                if let EventType::MouseMove { x, .. } = event.event_type {
                     // 只有未共享且到达右边缘时才进入共享
                     if x >= (screen_width as f64 - 1.0) && !*sharing {
                         println!("进入共享状态，隐藏光标并置于中心");
@@ -182,66 +182,66 @@ pub fn start_mouse_server(ip: String, port: u16) {
                         move_cursor_to(center_x, center_y);
                         *sharing = true;
                         // 进入共享锁住本地的键盘鼠标事件（除了鼠标移动）
-                        block_local_input();
+                        // std::thread::spawn(|| {
+                        //     block_local_input();
+                        // });
                     }
                 };
 
                 // 共享状态下，计算相对移动并重置鼠标
                 if *sharing {
-                    let mut mouse_event_queue = mouse_event_queue_clone.lock().unwrap();
-                    let mut key_event_queue = key_event_queue_clone.lock().unwrap();
+                    let mut event_queue = event_queue_clone.lock().unwrap();
 
                     match event.event_type {
                         EventType::MouseMove { x, y } => {
                             let dx = x as i32 - center_x;
                             let dy = y as i32 - center_y;
                             if dx != 0 || dy != 0 {
-                                mouse_event_queue.push(MouseEvent {
+                                event_queue.push(AnyEvent::MouseEvent(MouseEvent {
                                     kind: MouseEventKind::Move { dx, dy },
-                                });
-
+                                }));
                                 move_cursor_to(center_x, center_y);
                             }
                         }
 
                         EventType::ButtonPress(btn) => {
-                            mouse_event_queue.push(MouseEvent {
+                            event_queue.push(AnyEvent::MouseEvent(MouseEvent {
                                 kind: MouseEventKind::ButtonDown {
                                     button: format!("{:?}", btn),
                                 },
-                            });
+                            }));
                         }
 
                         EventType::ButtonRelease(btn) => {
-                            mouse_event_queue.push(MouseEvent {
+                            event_queue.push(AnyEvent::MouseEvent(MouseEvent {
                                 kind: MouseEventKind::ButtonUp {
                                     button: format!("{:?}", btn),
                                 },
-                            });
+                            }));
                         }
 
                         EventType::Wheel { delta_y, .. } => {
-                            mouse_event_queue.push(MouseEvent {
+                            event_queue.push(AnyEvent::MouseEvent(MouseEvent {
                                 kind: MouseEventKind::Wheel {
                                     delta: delta_y as i32,
                                 },
-                            });
+                            }));
                         }
 
                         EventType::KeyPress(key) => {
-                            key_event_queue.push(KeyEvent {
+                            event_queue.push(AnyEvent::KeyEvent(KeyEvent {
                                 kind: KeyEventKind::KeyDown {
                                     key: format!("{:?}", key),
                                 },
-                            });
+                            }));
                         }
 
                         EventType::KeyRelease(key) => {
-                            key_event_queue.push(KeyEvent {
+                            event_queue.push(AnyEvent::KeyEvent(KeyEvent {
                                 kind: KeyEventKind::KeyUp {
                                     key: format!("{:?}", key),
                                 },
-                            });
+                            }));
                         }
                     }
                 }
@@ -262,6 +262,8 @@ pub fn start_mouse_server(ip: String, port: u16) {
 
                     let is_sharing_recv = Arc::clone(&is_sharing);
                     let mut buf_reader = BufReader::new(stream.try_clone().unwrap());
+
+                    // 该线程用来监听客户端释放信号
                     thread::spawn(move || loop {
                         let mut buf = String::new();
                         match buf_reader.read_line(&mut buf) {
@@ -271,7 +273,7 @@ pub fn start_mouse_server(ip: String, port: u16) {
                                     *sharing = false;
                                     show_cursor();
                                     println!("收到客户端释放信号，恢复本机光标");
-                                    unblock_local_input();
+                                    // unblock_local_input();
                                     println!("已恢复本地键盘和鼠标按键输入");
                                     break;
                                 } else if n == 0 {
@@ -286,6 +288,7 @@ pub fn start_mouse_server(ip: String, port: u16) {
                         }
                     });
 
+                    // 服务端启动后，是否共享过
                     let mut last_sharing = false;
 
                     while *is_running.lock().unwrap() {
@@ -294,7 +297,7 @@ pub fn start_mouse_server(ip: String, port: u16) {
                         if !sharing && last_sharing {
                             println!("调用 mac_cursor::show_cursor()");
                             show_cursor();
-                            unblock_local_input();
+                            // unblock_local_input();
                         }
                         last_sharing = sharing;
 
@@ -303,21 +306,13 @@ pub fn start_mouse_server(ip: String, port: u16) {
                             // 持续锁定光标在中心
                             println!("move_cursor_to({}, {})", center_x, center_y);
                             move_cursor_to(center_x, center_y);
-                            let mut mouse_queue = mouse_event_queue.lock().unwrap();
-                            let mut key_queue = key_event_queue.lock().unwrap();
+                            let mut event_queue = event_queue.lock().unwrap();
 
-                            while let Some(evt) = key_queue.pop() {
+                            while let Some(evt) = event_queue.pop() {
                                 let msg = serde_json::to_string(&evt).unwrap() + "\n";
+                                println!("发送键鼠鼠标数据: {}", msg);
                                 if let Err(e) = stream.write_all(msg.as_bytes()) {
-                                    println!("发送键盘数据错误: {}", e);
-                                    break;
-                                }
-                            }
-
-                            while let Some(evt) = mouse_queue.pop() {
-                                let msg = serde_json::to_string(&evt).unwrap() + "\n";
-                                if let Err(e) = stream.write_all(msg.as_bytes()) {
-                                    println!("发送鼠标数据错误: {}", e);
+                                    println!("发送键鼠鼠标数据错误: {}", e);
                                     break;
                                 }
                             }
@@ -327,7 +322,7 @@ pub fn start_mouse_server(ip: String, port: u16) {
                     }
                     // 断开连接时恢复光标
                     show_cursor();
-                    unblock_local_input();
+                    // unblock_local_input();
                 }
                 Err(e) => {
                     println!("连接失败: {}, 2秒后重试", e);
@@ -337,6 +332,6 @@ pub fn start_mouse_server(ip: String, port: u16) {
         }
         // 线程退出时恢复光标和本地键鼠事件
         show_cursor();
-        unblock_local_input();
+        // unblock_local_input();
     });
 }

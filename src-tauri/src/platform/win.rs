@@ -1,11 +1,14 @@
-use std::ptr::null_mut;
-use std::sync::Once;
+use std::ptr;
+use std::sync::Mutex;
+use winapi::shared::minwindef::{LPARAM, WPARAM};
 use winapi::shared::windef::{HCURSOR, POINT};
-use winapi::um::winuser::ShowCursor;
+use winapi::um::winuser::{
+    CallNextHookEx, SetWindowsHookExW, ShowCursor, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
+};
+
 #[cfg(target_os = "windows")]
 pub fn hide_cursor() {
     unsafe {
-        // 多次调用，确保计数器为负，光标一定隐藏
         for _ in 0..10 {
             if ShowCursor(0) < 0 {
                 break;
@@ -17,7 +20,6 @@ pub fn hide_cursor() {
 #[cfg(target_os = "windows")]
 pub fn show_cursor() {
     unsafe {
-        // 多次调用，确保计数器为正，光标一定显示
         for _ in 0..10 {
             if ShowCursor(1) >= 0 {
                 break;
@@ -26,43 +28,37 @@ pub fn show_cursor() {
     }
 }
 
-use std::sync::Mutex;
-
-static mut HOOK_HANDLE: Option<isize> = None;
+// 用裸指针类型替代 HHOOK
+static mut HOOK_HANDLE: Option<(*mut std::ffi::c_void, *mut std::ffi::c_void)> = None;
 static HOOK_MUTEX: Mutex<()> = Mutex::new(());
 
 /// 屏蔽本地键盘和鼠标按键输入（不影响鼠标移动）
 #[cfg(target_os = "windows")]
 pub fn block_local_input() {
-    use windows::Win32::UI::WindowsAndMessaging::*;
-    use windows::Win32::Foundation::*;
-    use std::ptr;
-
     let _guard = HOOK_MUTEX.lock().unwrap();
 
-    unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-        // code >= 0 表示有事件，直接返回1阻断
+    unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> isize {
         if code >= 0 {
-            return LRESULT(1);
+            return 1;
         }
-        CallNextHookEx(None, code, wparam, lparam)
+        CallNextHookEx(ptr::null_mut(), code, wparam, lparam)
     }
 
     unsafe {
         if HOOK_HANDLE.is_some() {
             return; // 已经屏蔽
         }
-        // 安装键盘钩子
-        let h_keyboard = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), HINSTANCE(0), 0);
-        // 安装鼠标钩子
-        let h_mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), HINSTANCE(0), 0);
+        let h_keyboard = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), ptr::null_mut(), 0);
+        let h_mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), ptr::null_mut(), 0);
 
-        if h_keyboard.0 == 0 && h_mouse.0 == 0 {
+        if h_keyboard.is_null() && h_mouse.is_null() {
             eprintln!("安装钩子失败，可能没有权限");
             return;
         }
-        // 这里只保存一个句柄，实际可用元组保存两个
-        HOOK_HANDLE = Some(h_keyboard.0 as isize);
+        HOOK_HANDLE = Some((
+            h_keyboard as *mut std::ffi::c_void,
+            h_mouse as *mut std::ffi::c_void,
+        ));
         println!("已屏蔽本地键盘和鼠标按键输入（Windows）");
     }
 }
@@ -70,13 +66,16 @@ pub fn block_local_input() {
 /// 恢复本地输入
 #[cfg(target_os = "windows")]
 pub fn unblock_local_input() {
-    use windows::Win32::UI::WindowsAndMessaging::UnhookWindowsHookEx;
-
     let _guard = HOOK_MUTEX.lock().unwrap();
 
     unsafe {
-        if let Some(hook) = HOOK_HANDLE.take() {
-            UnhookWindowsHookEx(HHOOK(hook as isize));
+        if let Some((h_keyboard, h_mouse)) = HOOK_HANDLE.take() {
+            if !h_keyboard.is_null() {
+                UnhookWindowsHookEx(h_keyboard as _);
+            }
+            if !h_mouse.is_null() {
+                UnhookWindowsHookEx(h_mouse as _);
+            }
             println!("已恢复本地键盘和鼠标按键输入（Windows）");
         }
     }
