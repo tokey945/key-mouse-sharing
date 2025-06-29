@@ -1,6 +1,6 @@
 use crate::logic::{
-    hide_cursor, move_cursor_to, show_cursor, simulate_button_down, simulate_button_up,
-    simulate_key_down, simulate_key_up, simulate_wheel,
+    block_local_input, hide_cursor, move_cursor_to, show_cursor, simulate_button_down,
+    simulate_button_up, simulate_key_down, simulate_key_up, simulate_wheel, unblock_local_input,
 };
 use rdev::display_size;
 use rdev::{listen, EventType};
@@ -181,6 +181,8 @@ pub fn start_mouse_server(ip: String, port: u16) {
                         hide_cursor();
                         move_cursor_to(center_x, center_y);
                         *sharing = true;
+                        // 进入共享锁住本地的键盘鼠标事件（除了鼠标移动）
+                        block_local_input();
                     }
                 };
 
@@ -269,6 +271,12 @@ pub fn start_mouse_server(ip: String, port: u16) {
                                     *sharing = false;
                                     show_cursor();
                                     println!("收到客户端释放信号，恢复本机光标");
+                                    unblock_local_input();
+                                    println!("已恢复本地键盘和鼠标按键输入");
+                                    break;
+                                } else if n == 0 {
+                                    println!("客户端连接已关闭");
+                                    break;
                                 }
                             }
                             Err(e) => {
@@ -283,10 +291,10 @@ pub fn start_mouse_server(ip: String, port: u16) {
                     while *is_running.lock().unwrap() {
                         let sharing = *is_sharing.lock().unwrap();
 
-                        // 只在进入共享时隐藏光标，收到RELEASE时恢复
                         if !sharing && last_sharing {
                             println!("调用 mac_cursor::show_cursor()");
                             show_cursor();
+                            unblock_local_input();
                         }
                         last_sharing = sharing;
 
@@ -319,6 +327,7 @@ pub fn start_mouse_server(ip: String, port: u16) {
                     }
                     // 断开连接时恢复光标
                     show_cursor();
+                    unblock_local_input();
                 }
                 Err(e) => {
                     println!("连接失败: {}, 2秒后重试", e);
@@ -326,7 +335,8 @@ pub fn start_mouse_server(ip: String, port: u16) {
                 }
             }
         }
-        // 线程退出时恢复光标
+        // 线程退出时恢复光标和本地键鼠事件
         show_cursor();
+        unblock_local_input();
     });
 }

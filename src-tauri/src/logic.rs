@@ -67,6 +67,12 @@ pub fn simulate_key_up(key: &str) {
         enigo.key_up(k);
     }
 }
+pub fn block_local_input() {
+    crate::platform::block_local_input();
+}
+pub fn unblock_local_input() {
+    crate::platform::unblock_local_input();
+}
 
 fn str_to_enigo_key(key: &str) -> Option<enigo::Key> {
     crate::platform::str_to_enigo_key(key)

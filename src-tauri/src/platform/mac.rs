@@ -1,3 +1,5 @@
+#![allow(improper_ctypes_definitions)]
+
 #[cfg(target_os = "macos")]
 use core_foundation::base::TCFType;
 #[cfg(target_os = "macos")]
@@ -10,6 +12,8 @@ use core_graphics::display::{CGDisplayHideCursor, CGDisplayShowCursor, CGMainDis
 use std::sync::Once;
 #[cfg(target_os = "macos")]
 static INIT: Once = Once::new();
+#[allow(non_camel_case_types)]
+enum __CGEvent {}
 
 #[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -52,6 +56,140 @@ pub fn show_cursor() {
         CGDisplayShowCursor(CGMainDisplayID());
     }
 }
+use std::os::raw::{c_int, c_void};
+use std::ptr;
+use std::sync::Mutex;
+
+use core_foundation::runloop::{
+    kCFRunLoopCommonModes, CFRunLoopAddSource, CFRunLoopGetCurrent, CFRunLoopRun,
+    CFRunLoopSourceRef,
+};
+use core_graphics::event::{CGEventRef, CGEventType};
+
+type CGEventTapProxy = *mut c_void;
+type CFMachPortRef = *mut c_void;
+type CGEventMask = u64;
+type CGEventTapCallBack = extern "C" fn(
+    proxy: CGEventTapProxy,
+    type_: CGEventType,
+    event: *mut c_void,
+    refcon: *mut c_void,
+) -> *mut c_void;
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventTapCreate(
+        tap: u32,
+        place: u32,
+        options: u32,
+        eventsOfInterest: CGEventMask,
+        callback: CGEventTapCallBack,
+        userInfo: *mut c_void,
+    ) -> CFMachPortRef;
+
+    fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
+
+    fn CFMachPortCreateRunLoopSource(
+        allocator: *mut c_void,
+        port: CFMachPortRef,
+        order: c_int,
+    ) -> CFRunLoopSourceRef;
+
+    fn CFRelease(cf: *const c_void);
+}
+
+const KCG_HID_EVENT_TAP: u32 = 0;
+const KCG_HEAD_INSERT_EVENT_TAP: u32 = 0;
+const KCG_EVENT_TAP_OPTION_DEFAULT: u32 = 0;
+
+fn cg_event_mask_bit(event_type: CGEventType) -> CGEventMask {
+    1u64 << (event_type as u32)
+}
+
+static mut TAP: Option<CFMachPortRef> = None;
+static TAP_MUTEX: Mutex<()> = Mutex::new(());
+
+/// 屏蔽本地键盘和鼠标按键输入（不影响鼠标移动）
+pub fn block_local_input() {
+    let _guard = TAP_MUTEX.lock().unwrap();
+    unsafe {
+        if let Some(_) = TAP {
+            return;
+        }
+
+        extern "C" fn tap_callback(
+            _proxy: CGEventTapProxy,
+            type_: CGEventType,
+            _event: *mut c_void,
+            _user_info: *mut c_void,
+        ) -> *mut c_void {
+            match type_ {
+                CGEventType::KeyDown
+                | CGEventType::KeyUp
+                | CGEventType::FlagsChanged
+                | CGEventType::LeftMouseDown
+                | CGEventType::LeftMouseUp
+                | CGEventType::RightMouseDown
+                | CGEventType::RightMouseUp
+                | CGEventType::OtherMouseDown
+                | CGEventType::OtherMouseUp => std::ptr::null_mut(),
+                _ => _event,
+            }
+        }
+
+        let event_mask = cg_event_mask_bit(CGEventType::KeyDown)
+            | cg_event_mask_bit(CGEventType::KeyUp)
+            | cg_event_mask_bit(CGEventType::FlagsChanged)
+            | cg_event_mask_bit(CGEventType::LeftMouseDown)
+            | cg_event_mask_bit(CGEventType::LeftMouseUp)
+            | cg_event_mask_bit(CGEventType::RightMouseDown)
+            | cg_event_mask_bit(CGEventType::RightMouseUp)
+            | cg_event_mask_bit(CGEventType::OtherMouseDown)
+            | cg_event_mask_bit(CGEventType::OtherMouseUp);
+
+        let tap = CGEventTapCreate(
+            KCG_HID_EVENT_TAP,
+            KCG_HEAD_INSERT_EVENT_TAP,
+            KCG_EVENT_TAP_OPTION_DEFAULT,
+            event_mask,
+            tap_callback,
+            ptr::null_mut(),
+        );
+        if tap.is_null() {
+            eprintln!("创建事件钩子失败，可能没有辅助功能权限");
+            return;
+        }
+
+        let run_loop_source = CFMachPortCreateRunLoopSource(ptr::null_mut(), tap, 0);
+        CFRunLoopAddSource(
+            CFRunLoopGetCurrent(),
+            run_loop_source,
+            kCFRunLoopCommonModes,
+        );
+
+        CGEventTapEnable(tap, true);
+        TAP = Some(tap);
+
+        println!("已屏蔽本地键盘和鼠标按键输入（macOS）");
+
+        // 💡 启动事件循环（必须）
+        CFRunLoopRun();
+    }
+}
+
+/// 恢复本地输入
+pub fn unblock_local_input() {
+    let _guard = TAP_MUTEX.lock().unwrap();
+    unsafe {
+        if let Some(tap) = TAP.take() {
+            CGEventTapEnable(tap, false);
+            CFRelease(tap as *const c_void);
+            println!("已恢复本地键盘和鼠标按键输入（macOS）");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 pub fn str_to_enigo_key(key: &str) -> Option<enigo::Key> {
     use enigo::Key;
     match key {
@@ -111,7 +249,9 @@ pub fn str_to_enigo_key(key: &str) -> Option<enigo::Key> {
         // Alt/Option 键（左/右/通用/Option别名）
         "Alt" | "AltLeft" | "AltRight" | "KeyAlt" | "Option" => Some(Key::Alt),
         // Win键、Mac Command键、Meta键统一映射为 Meta
-        "Meta" | "MetaLeft" | "MetaRight" | "Command" | "Cmd" | "Win" | "KeyMeta" => Some(Key::Meta),
+        "Meta" | "MetaLeft" | "MetaRight" | "Command" | "Cmd" | "Win" | "KeyMeta" => {
+            Some(Key::Meta)
+        }
 
         // 方向键
         "ArrowUp" | "Up" | "KeyUp" => Some(Key::UpArrow),

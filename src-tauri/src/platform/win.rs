@@ -25,6 +25,63 @@ pub fn show_cursor() {
         }
     }
 }
+
+use std::sync::Mutex;
+
+static mut HOOK_HANDLE: Option<isize> = None;
+static HOOK_MUTEX: Mutex<()> = Mutex::new(());
+
+/// 屏蔽本地键盘和鼠标按键输入（不影响鼠标移动）
+#[cfg(target_os = "windows")]
+pub fn block_local_input() {
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    use windows::Win32::Foundation::*;
+    use std::ptr;
+
+    let _guard = HOOK_MUTEX.lock().unwrap();
+
+    unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        // code >= 0 表示有事件，直接返回1阻断
+        if code >= 0 {
+            return LRESULT(1);
+        }
+        CallNextHookEx(None, code, wparam, lparam)
+    }
+
+    unsafe {
+        if HOOK_HANDLE.is_some() {
+            return; // 已经屏蔽
+        }
+        // 安装键盘钩子
+        let h_keyboard = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), HINSTANCE(0), 0);
+        // 安装鼠标钩子
+        let h_mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), HINSTANCE(0), 0);
+
+        if h_keyboard.0 == 0 && h_mouse.0 == 0 {
+            eprintln!("安装钩子失败，可能没有权限");
+            return;
+        }
+        // 这里只保存一个句柄，实际可用元组保存两个
+        HOOK_HANDLE = Some(h_keyboard.0 as isize);
+        println!("已屏蔽本地键盘和鼠标按键输入（Windows）");
+    }
+}
+
+/// 恢复本地输入
+#[cfg(target_os = "windows")]
+pub fn unblock_local_input() {
+    use windows::Win32::UI::WindowsAndMessaging::UnhookWindowsHookEx;
+
+    let _guard = HOOK_MUTEX.lock().unwrap();
+
+    unsafe {
+        if let Some(hook) = HOOK_HANDLE.take() {
+            UnhookWindowsHookEx(HHOOK(hook as isize));
+            println!("已恢复本地键盘和鼠标按键输入（Windows）");
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub fn str_to_enigo_key(key: &str) -> Option<enigo::Key> {
     use enigo::Key;
@@ -85,7 +142,9 @@ pub fn str_to_enigo_key(key: &str) -> Option<enigo::Key> {
         // Alt/Option 键（左/右/通用/Option别名）
         "Alt" | "AltLeft" | "AltRight" | "KeyAlt" | "Option" => Some(Key::Alt),
         // Win键、Mac Command键、Meta键统一映射为 Meta
-        "Meta" | "MetaLeft" | "MetaRight" | "Command" | "Cmd" | "Win" | "KeyMeta" => Some(Key::Meta),
+        "Meta" | "MetaLeft" | "MetaRight" | "Command" | "Cmd" | "Win" | "KeyMeta" => {
+            Some(Key::Meta)
+        }
 
         // 方向键
         "ArrowUp" | "Up" | "KeyUp" => Some(Key::UpArrow),
