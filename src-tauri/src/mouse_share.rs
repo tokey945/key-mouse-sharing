@@ -2,12 +2,22 @@ use crate::logic::{
     block_local_input, hide_cursor, move_cursor_to, show_cursor, simulate_button_down,
     simulate_button_up, simulate_key_down, simulate_key_up, simulate_wheel, unblock_local_input,
 };
+use core_foundation::base::TCFType;
+use core_foundation::runloop::{
+    kCFRunLoopCommonModes, CFRunLoopAddSource, CFRunLoopGetCurrent, CFRunLoopRun,
+};
+use core_foundation_sys::base::kCFAllocatorDefault;
+use core_foundation_sys::mach_port::CFMachPortCreateRunLoopSource;
+use core_graphics::event::CallbackResult;
+use core_graphics::event::*;
+use core_graphics::event::{CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventType};
 use rdev::display_size;
 use rdev::{listen, EventType};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
+use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -168,6 +178,8 @@ pub fn start_mouse_server(ip: String, port: u16) {
         // 用于线程间传递dx/dy
         let event_queue = Arc::new(Mutex::new(Vec::new()));
         let event_queue_clone = Arc::clone(&event_queue);
+        let (drag_tx, drag_rx) = channel();
+        start_drag_listener(drag_tx);
         // 该线程用来监听本地键鼠事件，并判断是否进入共享状态，更新位置和共享状态
         thread::spawn(move || {
             let callback = move |event: rdev::Event| {
@@ -196,6 +208,7 @@ pub fn start_mouse_server(ip: String, port: u16) {
                         EventType::MouseMove { x, y } => {
                             let dx = x as i32 - center_x;
                             let dy = y as i32 - center_y;
+                            println!("dx={}, dy={}", dx, dy);
                             if dx != 0 || dy != 0 {
                                 event_queue.push(AnyEvent::MouseEvent(MouseEvent {
                                     kind: MouseEventKind::Move { dx, dy },
@@ -275,7 +288,6 @@ pub fn start_mouse_server(ip: String, port: u16) {
                                     println!("收到客户端释放信号，恢复本机光标");
                                     // unblock_local_input();
                                     println!("已恢复本地键盘和鼠标按键输入");
-                                    break;
                                 } else if n == 0 {
                                     println!("客户端连接已关闭");
                                     break;
@@ -303,8 +315,19 @@ pub fn start_mouse_server(ip: String, port: u16) {
 
                         // 共享状态下发送dx/dy
                         if sharing {
+                            // 先处理拖拽事件
+                            while let Ok((x, y)) = drag_rx.try_recv() {
+                                let dx = x as i32 - center_x;
+                                let dy = y as i32 - center_y;
+                                if dx != 0 || dy != 0 {
+                                    let mut event_queue = event_queue.lock().unwrap();
+                                    event_queue.push(AnyEvent::MouseEvent(MouseEvent {
+                                        kind: MouseEventKind::Move { dx, dy },
+                                    }));
+                                }
+                            }
+
                             // 持续锁定光标在中心
-                            println!("move_cursor_to({}, {})", center_x, center_y);
                             move_cursor_to(center_x, center_y);
                             let mut event_queue = event_queue.lock().unwrap();
 
@@ -333,5 +356,45 @@ pub fn start_mouse_server(ip: String, port: u16) {
         // 线程退出时恢复光标和本地键鼠事件
         show_cursor();
         // unblock_local_input();
+    });
+}
+
+fn start_drag_listener(tx: Sender<(f64, f64)>) {
+    std::thread::spawn(move || {
+        // 监听拖拽事件
+        let event_types = vec![
+            CGEventType::LeftMouseDragged,
+            CGEventType::RightMouseDragged,
+        ];
+
+        let tap = CGEventTap::new(
+            CGEventTapLocation::HID,
+            CGEventTapPlacement::HeadInsertEventTap,
+            CGEventTapOptions::Default,
+            event_types,
+            move |_, type_, event| {
+                if (type_ as u32) == CGEventType::LeftMouseDragged as u32
+                    || (type_ as u32) == CGEventType::RightMouseDragged as u32
+                {
+                    let loc = event.location();
+                    let _ = tx.send((loc.x, loc.y));
+                }
+                CallbackResult::Keep
+            },
+        )
+        .expect("Failed to create event tap");
+
+        let mach_port_ref = tap.mach_port().as_concrete_TypeRef();
+        let run_loop_source =
+            unsafe { CFMachPortCreateRunLoopSource(kCFAllocatorDefault, mach_port_ref, 0) };
+
+        unsafe {
+            CFRunLoopAddSource(
+                CFRunLoopGetCurrent(),
+                run_loop_source,
+                kCFRunLoopCommonModes,
+            );
+            CFRunLoopRun();
+        }
     });
 }
