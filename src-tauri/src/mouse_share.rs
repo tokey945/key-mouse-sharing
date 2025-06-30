@@ -1,16 +1,8 @@
 use crate::logic::{
     block_local_input, hide_cursor, move_cursor_to, show_cursor, simulate_button_down,
-    simulate_button_up, simulate_key_down, simulate_key_up, simulate_wheel, unblock_local_input,
+    simulate_button_up, simulate_key_down, simulate_key_up, simulate_wheel, start_drag_listener,
+    unblock_local_input,
 };
-use core_foundation::base::TCFType;
-use core_foundation::runloop::{
-    kCFRunLoopCommonModes, CFRunLoopAddSource, CFRunLoopGetCurrent, CFRunLoopRun,
-};
-use core_foundation_sys::base::kCFAllocatorDefault;
-use core_foundation_sys::mach_port::CFMachPortCreateRunLoopSource;
-use core_graphics::event::CallbackResult;
-use core_graphics::event::*;
-use core_graphics::event::{CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventType};
 use rdev::display_size;
 use rdev::{listen, EventType};
 use serde::{Deserialize, Serialize};
@@ -61,6 +53,7 @@ pub enum KeyEventKind {
 // 服务端或客户端是否启动运行
 lazy_static::lazy_static! {
     static ref IS_RUNNING: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    static ref IS_CONNECTED: std::sync::Arc<std::sync::Mutex<bool>> = std::sync::Arc::new(std::sync::Mutex::new(false));
 }
 
 #[tauri::command]
@@ -103,6 +96,10 @@ pub fn start_mouse_client(port: u16) {
                             Ok(l) => l,
                             Err(_) => break,
                         };
+                        if line.trim() == "RELEASE" {
+                            println!("[客户端] 收到 Release 信号，退出循环");
+                            break;
+                        }
 
                         match serde_json::from_str::<AnyEvent>(&line) {
                             Ok(AnyEvent::MouseEvent(evt)) => match evt.kind {
@@ -153,6 +150,7 @@ pub fn start_mouse_client(port: u16) {
                     }
                     println!("[客户端] 连接断开或循环结束");
                     let _ = stream.write_all(b"RELEASE\n");
+                    stream.flush().ok();
                 }
                 Err(e) => println!("[客户端] 接受连接错误: {}", e),
             }
@@ -167,6 +165,7 @@ pub fn start_mouse_server(ip: String, port: u16) {
     drop(running);
 
     let is_running = Arc::clone(&IS_RUNNING);
+    let is_running_main = Arc::clone(&is_running);
     thread::spawn(move || {
         let (screen_width, screen_height) = display_size().unwrap_or((1920, 1080));
         let center_x = (screen_width / 2) as i32;
@@ -178,11 +177,19 @@ pub fn start_mouse_server(ip: String, port: u16) {
         // 用于线程间传递dx/dy
         let event_queue = Arc::new(Mutex::new(Vec::new()));
         let event_queue_clone = Arc::clone(&event_queue);
+        // 启动平台拖拽监听
         let (drag_tx, drag_rx) = channel();
         start_drag_listener(drag_tx);
         // 该线程用来监听本地键鼠事件，并判断是否进入共享状态，更新位置和共享状态
         thread::spawn(move || {
             let callback = move |event: rdev::Event| {
+                if !*is_running.lock().unwrap() {
+                    return;
+                }
+                // 只有已连接时才允许进入共享
+                if !*IS_CONNECTED.lock().unwrap() {
+                    return;
+                }
                 let mut sharing = is_sharing_clone.lock().unwrap();
 
                 // 先判断是否进入共享条件
@@ -263,7 +270,7 @@ pub fn start_mouse_server(ip: String, port: u16) {
         });
 
         // 主循环：负责连接、同步数据、切换光标
-        while *is_running.lock().unwrap() {
+        while *is_running_main.lock().unwrap() {
             println!("尝试连接到 {}:{}", ip, port);
             let ip_addr: IpAddr = ip
                 .parse()
@@ -271,6 +278,10 @@ pub fn start_mouse_server(ip: String, port: u16) {
 
             match TcpStream::connect_timeout(&(ip_addr, port).into(), Duration::from_secs(2)) {
                 Ok(mut stream) => {
+                    {
+                        let mut connected = IS_CONNECTED.lock().unwrap();
+                        *connected = true;
+                    }
                     println!("已连接到服务器");
 
                     let is_sharing_recv = Arc::clone(&is_sharing);
@@ -303,7 +314,7 @@ pub fn start_mouse_server(ip: String, port: u16) {
                     // 服务端启动后，是否共享过
                     let mut last_sharing = false;
 
-                    while *is_running.lock().unwrap() {
+                    while *is_running_main.lock().unwrap() {
                         let sharing = *is_sharing.lock().unwrap();
 
                         if !sharing && last_sharing {
@@ -332,12 +343,14 @@ pub fn start_mouse_server(ip: String, port: u16) {
                             let mut event_queue = event_queue.lock().unwrap();
 
                             while let Some(evt) = event_queue.pop() {
+                                println!("准备发送事件: {:?}", evt);
                                 let msg = serde_json::to_string(&evt).unwrap() + "\n";
                                 println!("发送键鼠鼠标数据: {}", msg);
                                 if let Err(e) = stream.write_all(msg.as_bytes()) {
                                     println!("发送键鼠鼠标数据错误: {}", e);
                                     break;
                                 }
+                                stream.flush().ok();
                             }
                         }
 
@@ -345,9 +358,17 @@ pub fn start_mouse_server(ip: String, port: u16) {
                     }
                     // 断开连接时恢复光标
                     show_cursor();
-                    // unblock_local_input();
+                    let _ = stream.write_all(b"RELEASE\n");
+                    let _ = stream.flush();
+                    {
+                        let mut connected = IS_CONNECTED.lock().unwrap();
+                        *connected = false;
+                    }
                 }
                 Err(e) => {
+                    // 连接失败时确保 is_connected 为 false
+                    let mut connected = IS_CONNECTED.lock().unwrap();
+                    *connected = false;
                     println!("连接失败: {}, 2秒后重试", e);
                     thread::sleep(Duration::from_secs(2));
                 }
@@ -356,45 +377,5 @@ pub fn start_mouse_server(ip: String, port: u16) {
         // 线程退出时恢复光标和本地键鼠事件
         show_cursor();
         // unblock_local_input();
-    });
-}
-
-fn start_drag_listener(tx: Sender<(f64, f64)>) {
-    std::thread::spawn(move || {
-        // 监听拖拽事件
-        let event_types = vec![
-            CGEventType::LeftMouseDragged,
-            CGEventType::RightMouseDragged,
-        ];
-
-        let tap = CGEventTap::new(
-            CGEventTapLocation::HID,
-            CGEventTapPlacement::HeadInsertEventTap,
-            CGEventTapOptions::Default,
-            event_types,
-            move |_, type_, event| {
-                if (type_ as u32) == CGEventType::LeftMouseDragged as u32
-                    || (type_ as u32) == CGEventType::RightMouseDragged as u32
-                {
-                    let loc = event.location();
-                    let _ = tx.send((loc.x, loc.y));
-                }
-                CallbackResult::Keep
-            },
-        )
-        .expect("Failed to create event tap");
-
-        let mach_port_ref = tap.mach_port().as_concrete_TypeRef();
-        let run_loop_source =
-            unsafe { CFMachPortCreateRunLoopSource(kCFAllocatorDefault, mach_port_ref, 0) };
-
-        unsafe {
-            CFRunLoopAddSource(
-                CFRunLoopGetCurrent(),
-                run_loop_source,
-                kCFRunLoopCommonModes,
-            );
-            CFRunLoopRun();
-        }
     });
 }

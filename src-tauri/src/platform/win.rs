@@ -217,3 +217,33 @@ pub fn str_to_enigo_key(key: &str) -> Option<enigo::Key> {
         _ => None,
     }
 }
+
+#[cfg(target_os = "windows")]
+use std::sync::mpsc::Sender;
+
+#[cfg(target_os = "windows")]
+pub fn start_drag_listener(
+    tx: Sender<(f64, f64)>,
+    is_running: std::sync::Arc<std::sync::Mutex<bool>>,
+) {
+    std::thread::spawn(move || {
+        use rdev::{listen, Button, Event, EventType};
+        let mut left_down = false;
+        let callback = move |event: Event| {
+            if !*is_running.lock().unwrap() {
+                return;
+            }
+            match event.event_type {
+                EventType::ButtonPress(Button::Left) => left_down = true,
+                EventType::ButtonRelease(Button::Left) => left_down = false,
+                EventType::MouseMove { x, y } => {
+                    if left_down {
+                        let _ = tx.send((x, y));
+                    }
+                }
+                _ => {}
+            }
+        };
+        listen(callback).unwrap();
+    });
+}

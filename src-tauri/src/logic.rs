@@ -1,5 +1,7 @@
 use enigo::MouseControllable;
 use serde::{Deserialize, Serialize};
+use std::sync::mpsc::Sender;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MousePos {
     pub x: i32,
@@ -17,6 +19,9 @@ pub fn hide_cursor() {
 }
 pub fn show_cursor() {
     crate::platform::show_cursor();
+}
+pub fn start_drag_listener(tx: Sender<(f64, f64)>) {
+    crate::platform::start_drag_listener(tx);
 }
 pub fn move_cursor_to(dx: i32, dy: i32) {
     let mut enigo = enigo::Enigo::new();

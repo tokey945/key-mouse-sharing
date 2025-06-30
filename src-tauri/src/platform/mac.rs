@@ -12,6 +12,30 @@ use core_graphics::display::{CGDisplayHideCursor, CGDisplayShowCursor, CGMainDis
 use std::sync::Once;
 #[cfg(target_os = "macos")]
 static INIT: Once = Once::new();
+#[cfg(target_os = "macos")]
+use core_foundation::runloop::CFRunLoopSourceRef;
+#[cfg(target_os = "macos")]
+use core_foundation::runloop::{
+    kCFRunLoopCommonModes, CFRunLoopAddSource, CFRunLoopGetCurrent, CFRunLoopRun,
+};
+#[cfg(target_os = "macos")]
+use core_foundation_sys::base::kCFAllocatorDefault;
+#[cfg(target_os = "macos")]
+use core_graphics::event::CGEventType;
+#[cfg(target_os = "macos")]
+use core_graphics::event::CallbackResult;
+#[cfg(target_os = "macos")]
+use core_graphics::event::*;
+#[cfg(target_os = "macos")]
+use core_graphics::event::{CGEventTap, CGEventTapLocation, CGEventTapOptions};
+#[cfg(target_os = "macos")]
+use std::os::raw::{c_int, c_void};
+#[cfg(target_os = "macos")]
+use std::ptr;
+#[cfg(target_os = "macos")]
+use std::sync::mpsc::Sender;
+#[cfg(target_os = "macos")]
+use std::sync::Mutex;
 #[allow(non_camel_case_types)]
 enum __CGEvent {}
 
@@ -56,15 +80,55 @@ pub fn show_cursor() {
         CGDisplayShowCursor(CGMainDisplayID());
     }
 }
-use std::os::raw::{c_int, c_void};
-use std::ptr;
-use std::sync::Mutex;
 
-use core_foundation::runloop::{
-    kCFRunLoopCommonModes, CFRunLoopAddSource, CFRunLoopGetCurrent, CFRunLoopRun,
-    CFRunLoopSourceRef,
-};
-use core_graphics::event::{CGEventRef, CGEventType};
+// 监听拖拽事件
+#[cfg(target_os = "macos")]
+pub fn start_drag_listener(tx: Sender<(f64, f64)>) {
+    std::thread::spawn(move || {
+        // 监听拖拽事件
+        let event_types = vec![
+            CGEventType::LeftMouseDragged,
+            CGEventType::RightMouseDragged,
+        ];
+
+        let tap = CGEventTap::new(
+            CGEventTapLocation::HID,
+            CGEventTapPlacement::HeadInsertEventTap,
+            CGEventTapOptions::Default,
+            event_types,
+            move |_, type_, event| {
+                if (type_ as u32) == CGEventType::LeftMouseDragged as u32
+                    || (type_ as u32) == CGEventType::RightMouseDragged as u32
+                {
+                    let loc = event.location();
+                    if tx.send((loc.x, loc.y)).is_err() {
+                        println!("发送拖拽事件失败，channel 已关闭");
+                    }
+                }
+                CallbackResult::Keep
+            },
+        )
+        .expect("Failed to create event tap");
+
+        let mach_port_ref = tap.mach_port().as_concrete_TypeRef();
+        let run_loop_source = unsafe {
+            CFMachPortCreateRunLoopSource(
+                kCFAllocatorDefault as *mut std::ffi::c_void,
+                mach_port_ref as *mut std::ffi::c_void,
+                0,
+            )
+        };
+
+        unsafe {
+            CFRunLoopAddSource(
+                CFRunLoopGetCurrent(),
+                run_loop_source,
+                kCFRunLoopCommonModes,
+            );
+            CFRunLoopRun();
+        }
+    });
+}
 
 type CGEventTapProxy = *mut c_void;
 type CFMachPortRef = *mut c_void;
