@@ -1,11 +1,10 @@
 use crate::logic::{
     block_local_input, hide_cursor, move_cursor_to, show_cursor, simulate_button_down,
-    simulate_button_up, simulate_key_down, simulate_key_up, simulate_wheel, start_drag_listener,
-    unblock_local_input,
+    simulate_button_up, simulate_key_down, simulate_key_up, simulate_wheel, start_event_listener,
+    unblock_local_input, AnyEvent, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind,
 };
+use enigo::{Enigo, MouseButton, MouseControllable};
 use rdev::display_size;
-use rdev::{listen, EventType};
-use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
@@ -13,42 +12,6 @@ use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-
-// 键鼠事件
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(tag = "untagged")]
-enum AnyEvent {
-    MouseEvent(MouseEvent),
-    KeyEvent(KeyEvent),
-}
-
-// 鼠标事件
-#[derive(Serialize, Deserialize, Debug)]
-pub struct MouseEvent {
-    pub kind: MouseEventKind,
-}
-
-// 鼠标事件类型
-#[derive(Serialize, Deserialize, Debug)]
-pub enum MouseEventKind {
-    Move { dx: i32, dy: i32 },
-    ButtonDown { button: String },
-    ButtonUp { button: String },
-    Wheel { delta: i32 },
-}
-
-// 键盘事件
-#[derive(Serialize, Deserialize, Debug)]
-pub struct KeyEvent {
-    pub kind: KeyEventKind,
-}
-
-// 键盘事件类型
-#[derive(Serialize, Deserialize, Debug)]
-pub enum KeyEventKind {
-    KeyDown { key: String },
-    KeyUp { key: String },
-}
 
 // 服务端或客户端是否启动运行
 lazy_static::lazy_static! {
@@ -103,7 +66,7 @@ pub fn start_mouse_client(port: u16) {
 
                         match serde_json::from_str::<AnyEvent>(&line) {
                             Ok(AnyEvent::MouseEvent(evt)) => match evt.kind {
-                                MouseEventKind::Move { dx, dy } => {
+                                MouseEventKind::MoveDelta { dx, dy } => {
                                     cur_x = (cur_x + dx).clamp(0, max_x);
                                     cur_y = (cur_y + dy).clamp(0, max_y);
                                     println!(
@@ -129,15 +92,22 @@ pub fn start_mouse_client(port: u16) {
                                     println!("[客户端] 收到 Wheel: {}", delta);
                                     simulate_wheel(delta);
                                 }
+                                _ => {}
                             },
                             Ok(AnyEvent::KeyEvent(evt)) => match evt.kind {
                                 KeyEventKind::KeyDown { key } => {
                                     println!("[客户端] 收到 KeyDown: {}", key);
-                                    simulate_key_down(&key);
+                                    let res = std::panic::catch_unwind(|| simulate_key_down(&key));
+                                    if let Err(e) = res {
+                                        println!("simulate_key_down 崩溃: {:?}", e);
+                                    }
                                 }
                                 KeyEventKind::KeyUp { key } => {
                                     println!("[客户端] 收到 KeyUp: {}", key);
-                                    simulate_key_up(&key);
+                                    let res = std::panic::catch_unwind(|| simulate_key_up(&key));
+                                    if let Err(e) = res {
+                                        println!("simulate_key_up 崩溃: {:?}", e);
+                                    }
                                 }
                             },
                             Err(e) => println!("[客户端] 解析数据错误: {}", e),
@@ -178,11 +148,12 @@ pub fn start_mouse_server(ip: String, port: u16) {
         let event_queue = Arc::new(Mutex::new(Vec::new()));
         let event_queue_clone = Arc::clone(&event_queue);
         // 启动平台拖拽监听
-        let (drag_tx, drag_rx) = channel();
-        start_drag_listener(drag_tx, is_running.clone());
+        let (event_tx, event_rx) = channel();
+        start_event_listener(event_tx);
         // 该线程用来监听本地键鼠事件，并判断是否进入共享状态，更新位置和共享状态
         thread::spawn(move || {
-            let callback = move |event: rdev::Event| {
+            while let Ok(event) = event_rx.recv() {
+                println!("收到事件: {:?}", event);
                 if !*is_running.lock().unwrap() {
                     return;
                 }
@@ -193,9 +164,14 @@ pub fn start_mouse_server(ip: String, port: u16) {
                 let mut sharing = is_sharing_clone.lock().unwrap();
 
                 // 先判断是否进入共享条件
-                if let EventType::MouseMove { x, .. } = event.event_type {
+
+                if let AnyEvent::MouseEvent(MouseEvent {
+                    kind: MouseEventKind::Move { x: x, .. },
+                    ..
+                }) = &event
+                {
                     // 只有未共享且到达右边缘时才进入共享
-                    if x >= (screen_width as f64 - 1.0) && !*sharing {
+                    if *x >= (screen_width as i32 - 1) && !*sharing {
                         println!("进入共享状态，隐藏光标并置于中心");
                         hide_cursor();
                         move_cursor_to(center_x, center_y);
@@ -211,62 +187,74 @@ pub fn start_mouse_server(ip: String, port: u16) {
                 if *sharing {
                     let mut event_queue = event_queue_clone.lock().unwrap();
 
-                    match event.event_type {
-                        EventType::MouseMove { x, y } => {
-                            let dx = x as i32 - center_x;
-                            let dy = y as i32 - center_y;
+                    match &event {
+                        // 鼠标移动（绝对坐标）
+                        AnyEvent::MouseEvent(MouseEvent {
+                            kind: MouseEventKind::Move { x, y },
+                        }) => {
+                            let dx = *x - center_x;
+                            let dy = *y - center_y;
                             println!("dx={}, dy={}", dx, dy);
                             if dx != 0 || dy != 0 {
                                 event_queue.push(AnyEvent::MouseEvent(MouseEvent {
-                                    kind: MouseEventKind::Move { dx, dy },
+                                    kind: MouseEventKind::MoveDelta { dx, dy },
                                 }));
                                 move_cursor_to(center_x, center_y);
                             }
                         }
-
-                        EventType::ButtonPress(btn) => {
+                        // 鼠标按下
+                        AnyEvent::MouseEvent(MouseEvent {
+                            kind: MouseEventKind::ButtonDown { button },
+                        }) => {
                             event_queue.push(AnyEvent::MouseEvent(MouseEvent {
                                 kind: MouseEventKind::ButtonDown {
-                                    button: format!("{:?}", btn),
+                                    button: button.clone(),
                                 },
                             }));
+                            println!("收到 ButtonDown: {}", button);
                         }
-
-                        EventType::ButtonRelease(btn) => {
+                        // 鼠标抬起
+                        AnyEvent::MouseEvent(MouseEvent {
+                            kind: MouseEventKind::ButtonUp { button },
+                        }) => {
                             event_queue.push(AnyEvent::MouseEvent(MouseEvent {
                                 kind: MouseEventKind::ButtonUp {
-                                    button: format!("{:?}", btn),
+                                    button: button.clone(),
                                 },
                             }));
+                            println!("收到 ButtonUp: {}", button);
                         }
-
-                        EventType::Wheel { delta_y, .. } => {
+                        // 鼠标滚轮
+                        AnyEvent::MouseEvent(MouseEvent {
+                            kind: MouseEventKind::Wheel { delta },
+                        }) => {
                             event_queue.push(AnyEvent::MouseEvent(MouseEvent {
-                                kind: MouseEventKind::Wheel {
-                                    delta: delta_y as i32,
-                                },
+                                kind: MouseEventKind::Wheel { delta: *delta },
                             }));
+                            println!("收到 Wheel: {}", delta);
                         }
-
-                        EventType::KeyPress(key) => {
+                        // 键盘按下
+                        AnyEvent::KeyEvent(KeyEvent {
+                            kind: KeyEventKind::KeyDown { key },
+                        }) => {
                             event_queue.push(AnyEvent::KeyEvent(KeyEvent {
-                                kind: KeyEventKind::KeyDown {
-                                    key: format!("{:?}", key),
-                                },
+                                kind: KeyEventKind::KeyDown { key: key.clone() },
                             }));
+                            println!("收到 KeyDown: {}", key);
                         }
-
-                        EventType::KeyRelease(key) => {
+                        // 键盘抬起
+                        AnyEvent::KeyEvent(KeyEvent {
+                            kind: KeyEventKind::KeyUp { key },
+                        }) => {
                             event_queue.push(AnyEvent::KeyEvent(KeyEvent {
-                                kind: KeyEventKind::KeyUp {
-                                    key: format!("{:?}", key),
-                                },
+                                kind: KeyEventKind::KeyUp { key: key.clone() },
                             }));
+                            println!("收到 KeyUp: {}", key);
                         }
+                        _ => {}
                     }
                 }
-            };
-            listen(callback).unwrap();
+            }
         });
 
         // 主循环：负责连接、同步数据、切换光标
@@ -326,18 +314,6 @@ pub fn start_mouse_server(ip: String, port: u16) {
 
                         // 共享状态下发送dx/dy
                         if sharing {
-                            // 先处理拖拽事件
-                            while let Ok((x, y)) = drag_rx.try_recv() {
-                                let dx = x as i32 - center_x;
-                                let dy = y as i32 - center_y;
-                                if dx != 0 || dy != 0 {
-                                    let mut event_queue = event_queue.lock().unwrap();
-                                    event_queue.push(AnyEvent::MouseEvent(MouseEvent {
-                                        kind: MouseEventKind::Move { dx, dy },
-                                    }));
-                                }
-                            }
-
                             // 持续锁定光标在中心
                             move_cursor_to(center_x, center_y);
                             let mut event_queue = event_queue.lock().unwrap();
