@@ -179,7 +179,7 @@ pub fn start_mouse_server(ip: String, port: u16) {
         let event_queue_clone = Arc::clone(&event_queue);
         // 启动平台拖拽监听
         let (drag_tx, drag_rx) = channel();
-        start_drag_listener(drag_tx);
+        start_drag_listener(drag_tx, is_running.clone());
         // 该线程用来监听本地键鼠事件，并判断是否进入共享状态，更新位置和共享状态
         thread::spawn(move || {
             let callback = move |event: rdev::Event| {

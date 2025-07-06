@@ -1,5 +1,7 @@
 #![allow(improper_ctypes_definitions)]
 
+use std::sync::Arc;
+
 #[cfg(target_os = "macos")]
 use core_foundation::base::TCFType;
 #[cfg(target_os = "macos")]
@@ -20,6 +22,8 @@ use core_foundation::runloop::{
 };
 #[cfg(target_os = "macos")]
 use core_foundation_sys::base::kCFAllocatorDefault;
+use core_foundation_sys::runloop::CFRunLoopAddTimer;
+use core_foundation_sys::runloop::CFRunLoopTimerContext;
 #[cfg(target_os = "macos")]
 use core_graphics::event::CGEventType;
 #[cfg(target_os = "macos")]
@@ -38,6 +42,9 @@ use std::sync::mpsc::Sender;
 use std::sync::Mutex;
 #[allow(non_camel_case_types)]
 enum __CGEvent {}
+
+#[cfg(target_os = "macos")]
+use core_foundation_sys::runloop::CFRunLoopTimerRef;
 
 #[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -83,7 +90,7 @@ pub fn show_cursor() {
 
 // 监听拖拽事件
 #[cfg(target_os = "macos")]
-pub fn start_drag_listener(tx: Sender<(f64, f64)>) {
+pub fn start_drag_listener(tx: Sender<(f64, f64)>, is_running: Arc<Mutex<bool>>) {
     std::thread::spawn(move || {
         // 监听拖拽事件
         let event_types = vec![
@@ -119,12 +126,48 @@ pub fn start_drag_listener(tx: Sender<(f64, f64)>) {
             )
         };
 
+        let run_loop = unsafe { CFRunLoopGetCurrent() };
+
+        // 1. 传递 is_running 指针
+        let is_running_ptr = Arc::into_raw(is_running.clone()) as *mut c_void;
+
+        // 2. 定时器回调
+        extern "C" fn timer_callback(_timer: CFRunLoopTimerRef, info: *mut c_void) {
+            let is_running: &Arc<Mutex<bool>> = unsafe { &*(info as *const Arc<Mutex<bool>>) };
+            if !*is_running.lock().unwrap() {
+                unsafe {
+                    core_foundation_sys::runloop::CFRunLoopStop(
+                        core_foundation_sys::runloop::CFRunLoopGetCurrent(),
+                    )
+                };
+            }
+        }
+
+        // 3. 定时器上下文
+        let context = CFRunLoopTimerContext {
+            version: 0,
+            info: is_running_ptr,
+            retain: None,
+            release: None,
+            copyDescription: None,
+        };
+
+        // 4. 创建定时器
+        let timer = unsafe {
+            core_foundation_sys::runloop::CFRunLoopTimerCreate(
+                std::ptr::null_mut(),
+                core_foundation_sys::date::CFAbsoluteTimeGetCurrent(),
+                0.2, // 200ms
+                0,
+                0,
+                timer_callback,
+                &context as *const _ as *mut _,
+            )
+        };
+
+        // 5. 添加定时器到 runloop
         unsafe {
-            CFRunLoopAddSource(
-                CFRunLoopGetCurrent(),
-                run_loop_source,
-                kCFRunLoopCommonModes,
-            );
+            CFRunLoopAddTimer(run_loop, timer, kCFRunLoopCommonModes);
             CFRunLoopRun();
         }
     });
