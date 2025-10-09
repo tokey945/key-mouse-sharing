@@ -1,12 +1,12 @@
+use crate::logic::{AnyEvent, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind};
 use std::ptr;
+use std::sync::mpsc::Sender;
 use std::sync::Mutex;
 use winapi::shared::minwindef::{LPARAM, WPARAM};
 use winapi::shared::windef::{HCURSOR, POINT};
 use winapi::um::winuser::{
     CallNextHookEx, SetWindowsHookExW, ShowCursor, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
 };
-use crate::{AnyEvent, MouseEvent, MouseEventKind, KeyEvent, KeyEventKind};
-use std::sync::mpsc::Sender;
 
 #[cfg(target_os = "windows")]
 pub fn hide_cursor() {
@@ -225,28 +225,23 @@ pub fn start_drag_listener(tx: Sender<(f64, f64)>) {
     std::thread::spawn(move || {
         use rdev::{listen, Button, Event, EventType};
         let mut left_down = false;
-        let callback = move |event: Event| {
-            if !*is_running.lock().unwrap() {
-                return;
-            }
-            match event.event_type {
-                EventType::ButtonPress(Button::Left) => left_down = true,
-                EventType::ButtonRelease(Button::Left) => left_down = false,
-                EventType::MouseMove { x, y } => {
-                    if left_down {
-                        let _ = tx.send((x, y));
-                    }
+        let callback = move |event: Event| match event.event_type {
+            EventType::ButtonPress(Button::Left) => left_down = true,
+            EventType::ButtonRelease(Button::Left) => left_down = false,
+            EventType::MouseMove { x, y } => {
+                if left_down {
+                    let _ = tx.send((x, y));
                 }
-                _ => {}
             }
+            _ => {}
         };
         listen(callback).unwrap();
     });
 }
 
-pub fn start_win_event_listener(tx: Sender<AnyEvent>) {
+pub fn start_event_listener(tx: Sender<AnyEvent>) {
     std::thread::spawn(move || {
-        use rdev::{listen, Event, EventType, Button};
+        use rdev::{listen, Button, Event, EventType};
         let callback = move |event: Event| {
             match event.event_type {
                 EventType::MouseMove { x, y } => {
@@ -254,27 +249,37 @@ pub fn start_win_event_listener(tx: Sender<AnyEvent>) {
                 }
                 EventType::ButtonPress(btn) => {
                     let _ = tx.send(AnyEvent::MouseEvent(MouseEvent {
-                        kind: MouseEventKind::ButtonDown { button: format!("{:?}", btn) },
+                        kind: MouseEventKind::ButtonDown {
+                            button: format!("{:?}", btn),
+                        },
                     }));
                 }
                 EventType::ButtonRelease(btn) => {
                     let _ = tx.send(AnyEvent::MouseEvent(MouseEvent {
-                        kind: MouseEventKind::ButtonUp { button: format!("{:?}", btn) },
+                        kind: MouseEventKind::ButtonUp {
+                            button: format!("{:?}", btn),
+                        },
                     }));
                 }
                 EventType::Wheel { delta_y, .. } => {
                     let _ = tx.send(AnyEvent::MouseEvent(MouseEvent {
-                        kind: MouseEventKind::Wheel { delta: delta_y as i32 },
+                        kind: MouseEventKind::Wheel {
+                            delta: delta_y as i32,
+                        },
                     }));
                 }
                 EventType::KeyPress(key) => {
                     let _ = tx.send(AnyEvent::KeyEvent(KeyEvent {
-                        kind: KeyEventKind::KeyDown { key: format!("{:?}", key) },
+                        kind: KeyEventKind::KeyDown {
+                            key: format!("{:?}", key),
+                        },
                     }));
                 }
                 EventType::KeyRelease(key) => {
                     let _ = tx.send(AnyEvent::KeyEvent(KeyEvent {
-                        kind: KeyEventKind::KeyUp { key: format!("{:?}", key) },
+                        kind: KeyEventKind::KeyUp {
+                            key: format!("{:?}", key),
+                        },
                     }));
                 }
                 _ => {}

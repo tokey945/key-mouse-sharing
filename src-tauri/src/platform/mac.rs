@@ -314,25 +314,6 @@ pub fn str_to_enigo_key(key: &str) -> Option<enigo::Key> {
     }
 }
 
-pub fn keycode_to_string(keycode: i64) -> &'static str {
-    match keycode {
-        0 => "A",
-        1 => "S",
-        2 => "D",
-        3 => "F",
-        4 => "H",
-        5 => "G",
-        6 => "Z",
-        7 => "X",
-        8 => "C",
-        9 => "V",
-        36 => "Return",
-        49 => "Space",
-        // ...补全常用键
-        _ => "Unknown",
-    }
-}
-
 pub fn start_event_listener(tx: Sender<AnyEvent>) {
     std::thread::spawn(move || {
         let event_types = vec![
@@ -369,23 +350,25 @@ pub fn start_event_listener(tx: Sender<AnyEvent>) {
                     CGEventType::LeftMouseDown
                     | CGEventType::RightMouseDown
                     | CGEventType::OtherMouseDown => {
-                        let btn = format!(
-                            "{:?}",
-                            event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER)
-                        );
+                        let btn_num =
+                            event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER);
+                        let btn = mouse_to_string(btn_num);
                         let _ = tx.send(AnyEvent::MouseEvent(MouseEvent {
-                            kind: MouseEventKind::ButtonDown { button: btn },
+                            kind: MouseEventKind::ButtonDown {
+                                button: btn.to_string(),
+                            },
                         }));
                     }
                     CGEventType::LeftMouseUp
                     | CGEventType::RightMouseUp
                     | CGEventType::OtherMouseUp => {
-                        let btn = format!(
-                            "{:?}",
-                            event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER)
-                        );
+                        let btn_num =
+                            event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER);
+                        let btn = mouse_to_string(btn_num);
                         let _ = tx.send(AnyEvent::MouseEvent(MouseEvent {
-                            kind: MouseEventKind::ButtonUp { button: btn },
+                            kind: MouseEventKind::ButtonUp {
+                                button: btn.to_string(),
+                            },
                         }));
                     }
                     CGEventType::ScrollWheel => {
@@ -454,4 +437,141 @@ pub fn start_event_listener(tx: Sender<AnyEvent>) {
             CFRunLoopRun();
         }
     });
+}
+
+pub fn keycode_to_string(keycode: i64) -> &'static str {
+    match keycode {
+        // 字母
+        0 => "KeyA",
+        11 => "KeyB",
+        8 => "KeyC",
+        2 => "KeyD",
+        14 => "KeyE",
+        3 => "KeyF",
+        5 => "KeyG",
+        4 => "KeyH",
+        34 => "KeyI",
+        38 => "KeyJ",
+        40 => "KeyK",
+        37 => "KeyL",
+        46 => "KeyM",
+        45 => "KeyN",
+        31 => "KeyO",
+        35 => "KeyP",
+        12 => "KeyQ",
+        15 => "KeyR",
+        1 => "KeyS",
+        17 => "KeyT",
+        32 => "KeyU",
+        9 => "KeyV",
+        13 => "KeyW",
+        7 => "KeyX",
+        16 => "KeyY",
+        6 => "KeyZ",
+
+        // 数字
+        29 => "Key0",
+        18 => "Key1",
+        19 => "Key2",
+        20 => "Key3",
+        21 => "Key4",
+        23 => "Key5",
+        22 => "Key6",
+        26 => "Key7",
+        28 => "Key8",
+        25 => "Key9",
+
+        // 功能键
+        36 => "Enter", // Return
+        49 => "Space",
+        48 => "Tab",
+        53 => "Escape",
+        51 => "Backspace",
+        57 => "CapsLock",
+
+        // 修饰键
+        56 => "ShiftLeft",
+        60 => "ShiftRight",
+        59 => "ControlLeft",
+        62 => "ControlRight",
+        58 => "AltLeft",
+        61 => "AltRight",
+        55 => "MetaLeft",
+        54 => "MetaRight",
+
+        // 方向键
+        123 => "ArrowLeft",
+        124 => "ArrowRight",
+        125 => "ArrowDown",
+        126 => "ArrowUp",
+
+        // F区
+        122 => "F1",
+        120 => "F2",
+        99 => "F3",
+        118 => "F4",
+        96 => "F5",
+        97 => "F6",
+        98 => "F7",
+        100 => "F8",
+        101 => "F9",
+        109 => "F10",
+        103 => "F11",
+        111 => "F12",
+
+        // 其它常用符号
+        27 => "Minus",        // -
+        24 => "Equal",        // =
+        33 => "LeftBracket",  // [
+        30 => "RightBracket", // ]
+        42 => "Backslash",    // \
+        41 => "Semicolon",    // ;
+        39 => "Quote",        // '
+        43 => "Comma",        // ,
+        47 => "Period",       // .
+        44 => "Slash",        // /
+
+        // 小键盘（可选补充）
+        71 => "NumLock", // Clear
+        81 => "NumpadEqual",
+        67 => "NumpadMultiply",
+        69 => "NumpadAdd",
+        78 => "NumpadSubtract",
+        75 => "NumpadDivide",
+        65 => "NumpadDecimal",
+        76 => "NumpadEnter",
+        82 => "Numpad0",
+        83 => "Numpad1",
+        84 => "Numpad2",
+        85 => "Numpad3",
+        86 => "Numpad4",
+        87 => "Numpad5",
+        88 => "Numpad6",
+        89 => "Numpad7",
+        91 => "Numpad8",
+        92 => "Numpad9",
+
+        // 其它
+        114 => "Insert",
+        115 => "Home",
+        119 => "End",
+        116 => "PageUp",
+        121 => "PageDown",
+        117 => "Delete",
+
+        // 你可以根据需要继续补充
+        _ => "Unknown",
+    }
+}
+
+/// macOS MOUSE_EVENT_BUTTON_NUMBER 映射
+pub fn mouse_to_string(btn: i64) -> &'static str {
+    match btn {
+        0 => "Left",    // 左键
+        1 => "Right",   // 右键
+        2 => "Middle",  // 中键
+        3 => "Button4", // 侧键1
+        4 => "Button5", // 侧键2
+        _ => "Unknown",
+    }
 }

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref } from 'vue'
-import { invoke } from '@tauri-apps/api/core';
-import { message } from '@tauri-apps/plugin-dialog';
+import { invoke } from '@tauri-apps/api/core'
+import { message } from '@tauri-apps/plugin-dialog'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { Input } from '@/components/ui/input'
@@ -18,7 +18,6 @@ import {
 const role = ref('server')
 const ip = ref('192.168.1.5')
 const port = ref(4000)
-
 
 // 模拟的日志数据
 const logs = ref([
@@ -44,10 +43,14 @@ const logs = ref([
 // 用于根据日志级别返回不同颜色的类
 const getLogClass = (level: string) => {
   switch (level) {
-    case 'error': return 'text-red-500'
-    case 'warn': return 'text-yellow-500'
-    case 'success': return 'text-green-500'
-    default: return ''
+    case 'error':
+      return 'text-red-500'
+    case 'warn':
+      return 'text-yellow-500'
+    case 'success':
+      return 'text-green-500'
+    default:
+      return ''
   }
 }
 
@@ -55,14 +58,14 @@ const start = async () => {
   try {
     if (role.value === 'server') {
       if (!ip.value) {
-        await message('请输入目标 IP 地址');
+        await message('请输入目标 IP 地址')
         return
       }
       await invoke('start_mouse_server', { ip: ip.value, port: port.value })
-      await message('控制端已启动');
+      await message('控制端已启动')
     } else {
       await invoke('start_mouse_client', { port: port.value })
-      await message('客户端已启动');
+      await message('客户端已启动')
     }
   } catch (error: any) {
     console.error('启动失败:', error)
@@ -96,7 +99,7 @@ const stop = async () => {
     </RadioGroup>
     <div class="grid w-full max-w-sm items-center gap-1.5">
       <Label for="email">目标 IP：</Label>
-      <Input v-model="ip" type="text" class="w-40  focus-visible:ring-0 " />
+      <Input v-model="ip" type="text" class="w-40 focus-visible:ring-0" />
     </div>
     <NumberField id="age" v-model="port" :formatOptions="{ useGrouping: false }" :min="0" class="w-40">
       <Label for="age">端口：</Label>
@@ -119,7 +122,8 @@ const stop = async () => {
       <!-- 使用 pre 标签和等宽字体 -->
       <div class="font-mono text-sm">
         <div v-for="(log, index) in logs" :key="index" :class="getLogClass(log.level)">
-          {{ new Date().toLocaleTimeString() }} [{{ log.level.toUpperCase() }}]: {{ log.message }}
+          {{ new Date().toLocaleTimeString() }} [{{ log.level.toUpperCase() }}]:
+          {{ log.message }}
         </div>
       </div>
     </ScrollArea>

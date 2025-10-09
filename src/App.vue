@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
-import AppSidebar from "@/components/AppSidebar.vue";
-import ColorMode from "@/components/ColorMode.vue";
+import { SidebarProvider, SidebarTrigger } from '@/components/ui/sidebar'
+import AppSidebar from '@/components/AppSidebar.vue'
+import ColorMode from '@/components/ColorMode.vue'
 </script>
 
 <template>

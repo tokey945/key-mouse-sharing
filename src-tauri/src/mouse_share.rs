@@ -3,12 +3,11 @@ use crate::logic::{
     simulate_button_up, simulate_key_down, simulate_key_up, simulate_wheel, start_event_listener,
     unblock_local_input, AnyEvent, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind,
 };
-use enigo::{Enigo, MouseButton, MouseControllable};
 use rdev::display_size;
 use std::io::Write;
 use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -147,13 +146,17 @@ pub fn start_mouse_server(ip: String, port: u16) {
         // 用于线程间传递dx/dy
         let event_queue = Arc::new(Mutex::new(Vec::new()));
         let event_queue_clone = Arc::clone(&event_queue);
+
+        let pending_move = Arc::new(Mutex::new(None));
+        let pending_move_clone = Arc::clone(&pending_move);
         // 启动平台拖拽监听
         let (event_tx, event_rx) = channel();
         start_event_listener(event_tx);
         // 该线程用来监听本地键鼠事件，并判断是否进入共享状态，更新位置和共享状态
         thread::spawn(move || {
+            let mut last_x = center_x;
+            let mut last_y = center_y;
             while let Ok(event) = event_rx.recv() {
-                println!("收到事件: {:?}", event);
                 if !*is_running.lock().unwrap() {
                     return;
                 }
@@ -166,8 +169,7 @@ pub fn start_mouse_server(ip: String, port: u16) {
                 // 先判断是否进入共享条件
 
                 if let AnyEvent::MouseEvent(MouseEvent {
-                    kind: MouseEventKind::Move { x: x, .. },
-                    ..
+                    kind: MouseEventKind::Move { x, .. },
                 }) = &event
                 {
                     // 只有未共享且到达右边缘时才进入共享
@@ -192,13 +194,13 @@ pub fn start_mouse_server(ip: String, port: u16) {
                         AnyEvent::MouseEvent(MouseEvent {
                             kind: MouseEventKind::Move { x, y },
                         }) => {
-                            let dx = *x - center_x;
-                            let dy = *y - center_y;
+                            let dx = *x - last_x;
+                            let dy = *y - last_y;
                             println!("dx={}, dy={}", dx, dy);
                             if dx != 0 || dy != 0 {
-                                event_queue.push(AnyEvent::MouseEvent(MouseEvent {
-                                    kind: MouseEventKind::MoveDelta { dx, dy },
-                                }));
+                                last_x = *x;
+                                last_y = *y;
+                                *pending_move_clone.lock().unwrap() = Some((dx, dy));
                                 move_cursor_to(center_x, center_y);
                             }
                         }
@@ -314,10 +316,16 @@ pub fn start_mouse_server(ip: String, port: u16) {
 
                         // 共享状态下发送dx/dy
                         if sharing {
-                            // 持续锁定光标在中心
-                            move_cursor_to(center_x, center_y);
                             let mut event_queue = event_queue.lock().unwrap();
 
+                            // 每 1~3ms 发送一次
+                            if let Some((dx, dy)) = pending_move.lock().unwrap().take() {
+                                event_queue.push(AnyEvent::MouseEvent(MouseEvent {
+                                    kind: MouseEventKind::MoveDelta { dx, dy },
+                                }));
+                            }
+
+                            // 发送队列中的所有事件
                             while let Some(evt) = event_queue.pop() {
                                 println!("准备发送事件: {:?}", evt);
                                 let msg = serde_json::to_string(&evt).unwrap() + "\n";
