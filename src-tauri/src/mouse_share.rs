@@ -1,7 +1,7 @@
 use crate::logic::{
-    block_local_input, hide_cursor, move_cursor_to, show_cursor, simulate_button_down,
-    simulate_button_up, simulate_key_down, simulate_key_up, simulate_wheel, start_event_listener,
-    unblock_local_input, AnyEvent, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind,
+    hide_cursor, move_cursor_to, show_cursor, simulate_button_down, simulate_button_up,
+    simulate_key_down, simulate_key_up, simulate_wheel, start_event_listener, AnyEvent, KeyEvent,
+    KeyEventKind, MouseEvent, MouseEventKind,
 };
 use rdev::display_size;
 use std::io::Write;

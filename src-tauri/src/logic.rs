@@ -1,6 +1,6 @@
 use enigo::MouseButton;
 use enigo::MouseControllable;
-use enigo::{Enigo, Key, KeyboardControllable};
+use enigo::{Enigo, KeyboardControllable};
 use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MousePos {
@@ -84,14 +84,14 @@ pub fn simulate_wheel(delta: i32) {
 
 pub fn simulate_key_down(key: &str) {
     if let Some(k) = str_to_enigo_key(key) {
-        let mut enigo = enigo::Enigo::new();
+        let mut enigo = Enigo::new();
         enigo.key_down(k);
     }
 }
 
 pub fn simulate_key_up(key: &str) {
     if let Some(k) = str_to_enigo_key(key) {
-        let mut enigo = enigo::Enigo::new();
+        let mut enigo = Enigo::new();
         enigo.key_up(k);
     }
 }

@@ -8,11 +8,11 @@ import ColorMode from '@/components/ColorMode.vue'
   <SidebarProvider>
     <AppSidebar />
     <main class="w-full h-screen flex flex-col">
-      <div class="px-2 flex items-center justify-between">
+      <div data-tauri-drag-region class="px-6 flex items-center justify-between">
         <SidebarTrigger />
         <ColorMode />
       </div>
-      <div class="flex-1 min-h-0">
+      <div class="flex-1 min-h-0 pl-4">
         <RouterView />
       </div>
     </main>
