@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref } from 'vue'
+import { useStorage } from '@vueuse/core'
 import { invoke } from '@tauri-apps/api/core'
 import { message } from '@tauri-apps/plugin-dialog'
 import { Button } from '@/components/ui/button'
@@ -15,9 +16,9 @@ import {
   NumberFieldInput,
 } from '@/components/ui/number-field'
 
-const role = ref('server')
-const ip = ref('192.168.1.5')
-const port = ref(4000)
+const role = useStorage('kms-role', 'server')
+const ip = useStorage('kms-ip', '192.168.1.5')
+const port = useStorage('kms-port', 4000)
 
 // 模拟的日志数据
 const logs = ref([
