@@ -387,6 +387,7 @@ pub fn start_mouse_client(app: AppHandle, port: u16, pair_code: String) -> Resul
                                             let scaled_dx = (dx as f64 * MOUSE_SPEED_FACTOR) as i32;
                                             let scaled_dy = (dy as f64 * MOUSE_SPEED_FACTOR) as i32;
 
+                                            // Windows 需要反向
                                             #[cfg(target_os = "windows")]
                                             let (scaled_dx, scaled_dy) = (-scaled_dx, -scaled_dy);
 
