@@ -765,8 +765,12 @@ pub fn start_mouse_server(
                     // 连接失败时确保 is_connected 为 false
                     let mut connected = IS_CONNECTED.lock().unwrap();
                     *connected = false;
-                    emit_runtime_log(&app_handle, "warn", format!("连接失败: {}", e));
-                    println!("连接失败: {}, 2 秒后重试", e);
+                    let err_msg = format!("连接失败: {}", e);
+                    emit_runtime_log(&app_handle, "warn", &err_msg);
+                    println!(
+                        "{}，请检查：1. 目标 IP 是否正确 2. 防火墙是否阻止 3. 端口是否开放",
+                        err_msg
+                    );
 
                     if !*is_running_main.lock().unwrap() {
                         break;
