@@ -6,7 +6,7 @@ use crate::logic::{
 use rdev::display_size;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, BufReader, Write};
-use std::net::{IpAddr, Ipv4Addr, Shutdown, TcpListener, TcpStream};
+use std::net::{IpAddr, Shutdown, TcpListener, TcpStream};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -247,12 +247,23 @@ pub fn start_mouse_client(app: AppHandle, port: u16, pair_code: String) -> Resul
     let app_handle = app.clone();
     thread::spawn(move || {
         // 客户端角色：监听端口，等待控制端接入。
-        let listener = match TcpListener::bind(("::", port)) {
+        // 同时监听 IPv4 和 IPv6
+        let listener = match TcpListener::bind(("0.0.0.0", port)) {
             Ok(listener) => listener,
             Err(e) => {
-                emit_runtime_log(&app_handle, "error", format!("客户端监听失败: {}", e));
-                println!("[客户端] 监听端口失败: {}", e);
-                return;
+                // 如果 IPv4 失败，尝试 IPv6
+                match TcpListener::bind(("::", port)) {
+                    Ok(listener) => listener,
+                    Err(e2) => {
+                        emit_runtime_log(
+                            &app_handle,
+                            "error",
+                            format!("客户端监听失败(IPv4: {}, IPv6: {})", e, e2),
+                        );
+                        println!("[客户端] 监听端口失败: IPv4={}, IPv6={}", e, e2);
+                        return;
+                    }
+                }
             }
         };
 
@@ -260,7 +271,16 @@ pub fn start_mouse_client(app: AppHandle, port: u16, pair_code: String) -> Resul
             println!("[客户端] 设置监听非阻塞失败: {}", e);
         }
 
-        println!("客户端监听端口: {}", port);
+        let local_addr = listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+        println!("客户端监听端口: {} (地址: {})", port, local_addr);
+        emit_runtime_log(
+            &app_handle,
+            "info",
+            format!("客户端已启动，监听 {}，等待连接...", local_addr),
+        );
 
         while *is_running.lock().unwrap() {
             match listener.accept() {
@@ -589,19 +609,24 @@ pub fn start_mouse_server(
 
         // 连接主循环：负责重连、握手、加密发送事件、接收 RELEASE。
         while *is_running_main.lock().unwrap() {
-            println!("尝试连接到 {}:{}", ip, port);
+            let target_addr = format!("{}:{}", ip, port);
+            println!("尝试连接到 {}", target_addr);
+
             let ip_addr: IpAddr = match ip.parse() {
                 Ok(addr) => addr,
-                Err(_) => {
-                    // 尝试解析为IPv6地址，如果失败则回退到IPv4本地地址
-                    match ip.parse::<std::net::Ipv6Addr>() {
-                        Ok(v6_addr) => IpAddr::V6(v6_addr),
-                        Err(_) => IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-                    }
+                Err(e) => {
+                    emit_runtime_log(
+                        &app_handle,
+                        "warn",
+                        format!("IP 地址解析失败: {}, 请检查格式", ip),
+                    );
+                    println!("[控制端] IP 地址解析失败: {}, 错误: {}", ip, e);
+                    thread::sleep(Duration::from_secs(1));
+                    continue;
                 }
             };
 
-            match TcpStream::connect_timeout(&(ip_addr, port).into(), Duration::from_secs(2)) {
+            match TcpStream::connect_timeout(&(ip_addr, port).into(), Duration::from_secs(5)) {
                 Ok(mut stream) => {
                     let _ = stream.set_nodelay(true);
                     let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
