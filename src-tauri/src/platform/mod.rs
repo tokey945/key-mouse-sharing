@@ -1,4 +1,6 @@
-use serde::{Deserialize, Serialize};
+// 平台抽象层：
+// - 对外暴露统一函数签名
+// - 内部按 target_os 分发到 mac/win 实现
 #[cfg(target_os = "macos")]
 mod mac;
 #[cfg(target_os = "windows")]

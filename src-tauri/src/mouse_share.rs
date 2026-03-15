@@ -3,138 +3,642 @@ use crate::logic::{
     simulate_key_down, simulate_key_up, simulate_wheel, start_event_listener, AnyEvent, KeyEvent,
     KeyEventKind, MouseEvent, MouseEventKind,
 };
+use chacha20poly1305::aead::Aead;
+use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
+use hmac::{Hmac, Mac};
+use rand::rngs::OsRng;
+use rand::RngCore;
 use rdev::display_size;
-use std::io::Write;
-use std::io::{BufRead, BufReader};
-use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
+use sha2::Sha256;
+use std::collections::{HashMap, VecDeque};
+use std::io::{self, BufRead, BufReader, Write};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, TcpListener, TcpStream};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tauri::{AppHandle, Emitter};
 
-// 服务端或客户端是否启动运行
+// 核心说明：
+// 1. `start_mouse_server` 是控制端（主动连接到接收端）；
+// 2. `start_mouse_client` 是接收端（监听端口，执行远端输入）；
+// 3. 握手阶段：挑战应答 + 会话密钥派生；
+// 4. 业务阶段：所有消息使用 DATA 帧加密传输。
 lazy_static::lazy_static! {
+    // 线程共享运行状态，stop_sharing 会将其置为 false。
     static ref IS_RUNNING: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-    static ref IS_CONNECTED: std::sync::Arc<std::sync::Mutex<bool>> = std::sync::Arc::new(std::sync::Mutex::new(false));
+    // 仅表示当前是否存在已鉴权连接，供输入采集线程判断是否进入共享态。
+    static ref IS_CONNECTED: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    // 接收端鉴权限流状态（按来源 IP 统计）。
+    static ref AUTH_RATE_LIMITER: Mutex<AuthRateLimiter> = Mutex::new(AuthRateLimiter::default());
+}
+
+const AUTH_PREFIX: &str = "AUTH ";
+const AUTH_OK: &str = "AUTH_OK";
+const AUTH_FAIL: &str = "AUTH_FAIL";
+const DATA_PREFIX: &str = "DATA ";
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+const AUTH_WINDOW: Duration = Duration::from_secs(60);
+const AUTH_LOCK_DURATION: Duration = Duration::from_secs(120);
+const AUTH_MAX_FAILS: usize = 5;
+
+#[derive(Default)]
+struct AuthRateLimiter {
+    // 在 AUTH_WINDOW 时间窗内的失败时间点。
+    failed_attempts: HashMap<IpAddr, Vec<Instant>>,
+    // 被封禁到什么时间点。
+    blocked_until: HashMap<IpAddr, Instant>,
+}
+
+#[derive(serde::Serialize, Clone)]
+struct RuntimeLogEvent {
+    level: String,
+    message: String,
+    ts_ms: u64,
+}
+
+fn is_socket_timeout(err: &io::Error) -> bool {
+    matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+}
+
+// 统一把后端运行信息推给前端日志面板（事件名：kms-log）。
+fn emit_runtime_log(app: &AppHandle, level: &str, message: impl Into<String>) {
+    let ts_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let event = RuntimeLogEvent {
+        level: level.to_string(),
+        message: message.into(),
+        ts_ms,
+    };
+    let _ = app.emit("kms-log", event);
+}
+
+// 配对码强度策略：至少 8 位，且必须包含字母+数字。
+fn validate_pair_code_strength(pair_code: &str) -> Result<(), String> {
+    if pair_code.len() < 8 {
+        return Err("配对码至少 8 位".to_string());
+    }
+    let has_alpha = pair_code.chars().any(|c| c.is_ascii_alphabetic());
+    let has_digit = pair_code.chars().any(|c| c.is_ascii_digit());
+    if !(has_alpha && has_digit) {
+        return Err("配对码必须同时包含字母和数字".to_string());
+    }
+    Ok(())
+}
+
+// 清理时间窗外的失败记录，避免哈希表无限增长。
+fn auth_prune_old_attempts(ip: IpAddr, limiter: &mut AuthRateLimiter, now: Instant) {
+    if let Some(history) = limiter.failed_attempts.get_mut(&ip) {
+        history.retain(|ts| now.duration_since(*ts) <= AUTH_WINDOW);
+        if history.is_empty() {
+            limiter.failed_attempts.remove(&ip);
+        }
+    }
+}
+
+// 查询某个来源 IP 是否仍在封禁期。
+fn auth_block_remaining(ip: IpAddr) -> Option<Duration> {
+    let now = Instant::now();
+    let mut limiter = AUTH_RATE_LIMITER.lock().unwrap();
+
+    if let Some(until) = limiter.blocked_until.get(&ip).copied() {
+        if until > now {
+            return Some(until.duration_since(now));
+        }
+        limiter.blocked_until.remove(&ip);
+    }
+
+    auth_prune_old_attempts(ip, &mut limiter, now);
+    None
+}
+
+// 记录一次失败；达到阈值后进入临时封禁。
+fn auth_record_failure(ip: IpAddr) {
+    let now = Instant::now();
+    let mut limiter = AUTH_RATE_LIMITER.lock().unwrap();
+    auth_prune_old_attempts(ip, &mut limiter, now);
+    let should_block = {
+        let history = limiter.failed_attempts.entry(ip).or_default();
+        history.push(now);
+        history.len() >= AUTH_MAX_FAILS
+    };
+    if should_block {
+        limiter
+            .blocked_until
+            .insert(ip, now + AUTH_LOCK_DURATION);
+        limiter.failed_attempts.remove(&ip);
+    }
+}
+
+// 鉴权成功后，清理该 IP 的历史失败与封禁状态。
+fn auth_record_success(ip: IpAddr) {
+    let mut limiter = AUTH_RATE_LIMITER.lock().unwrap();
+    limiter.failed_attempts.remove(&ip);
+    limiter.blocked_until.remove(&ip);
+}
+
+// 将字节编码成十六进制字符串，便于走文本协议。
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+// 单字符十六进制解析。
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+// 十六进制字符串转字节数组。
+fn hex_to_bytes(input: &str) -> Result<Vec<u8>, String> {
+    let bytes = input.as_bytes();
+    if bytes.len() % 2 != 0 {
+        return Err("十六进制长度不合法".to_string());
+    }
+
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let hi = hex_nibble(bytes[i]).ok_or_else(|| "十六进制字符不合法".to_string())?;
+        let lo = hex_nibble(bytes[i + 1]).ok_or_else(|| "十六进制字符不合法".to_string())?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Ok(out)
+}
+
+// 常数时间比较，减少基于时间差的探测风险。
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+// 鉴权 HMAC：HMAC-SHA256(pair_code, nonce)。
+fn build_hmac(pair_code: &str, nonce: &[u8]) -> Result<Vec<u8>, String> {
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(pair_code.as_bytes())
+        .map_err(|e| format!("创建 HMAC 失败: {}", e))?;
+    mac.update(nonce);
+    Ok(mac.finalize().into_bytes().to_vec())
+}
+
+// 会话密钥派生：同一个材料下用不同 label 生成收发不同密钥。
+fn derive_session_key(pair_code: &str, label: &[u8], material: &[u8]) -> Result<[u8; 32], String> {
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(pair_code.as_bytes())
+        .map_err(|e| format!("创建密钥派生 HMAC 失败: {}", e))?;
+    mac.update(label);
+    mac.update(material);
+    let digest = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest[..32]);
+    Ok(out)
+}
+
+#[derive(Clone, Copy)]
+struct SessionKeys {
+    send_key: [u8; 32],
+    recv_key: [u8; 32],
+}
+
+// 业务消息加密并封装为 DATA 帧（nonce + ciphertext）。
+fn encrypt_frame(send_key: &[u8; 32], plain: &str) -> Result<String, String> {
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(send_key));
+
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let ciphertext = cipher
+        .encrypt(nonce, plain.as_bytes())
+        .map_err(|e| format!("加密失败: {}", e))?;
+
+    Ok(format!(
+        "{DATA_PREFIX}{} {}\n",
+        bytes_to_hex(&nonce_bytes),
+        bytes_to_hex(&ciphertext)
+    ))
+}
+
+// 解析并解密 DATA 帧。
+fn decrypt_frame(recv_key: &[u8; 32], frame: &str) -> Result<String, String> {
+    let frame = frame.trim();
+    let Some(rest) = frame.strip_prefix(DATA_PREFIX) else {
+        return Err("数据帧协议不匹配".to_string());
+    };
+
+    let mut parts = rest.splitn(2, ' ');
+    let nonce_hex = parts.next().ok_or_else(|| "数据帧缺少 nonce".to_string())?;
+    let cipher_hex = parts.next().ok_or_else(|| "数据帧缺少密文".to_string())?;
+
+    let nonce_bytes = hex_to_bytes(nonce_hex)?;
+    if nonce_bytes.len() != 12 {
+        return Err("数据帧 nonce 长度不合法".to_string());
+    }
+    let cipher_bytes = hex_to_bytes(cipher_hex)?;
+
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(recv_key));
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let plain = cipher
+        .decrypt(nonce, cipher_bytes.as_ref())
+        .map_err(|e| format!("解密失败: {}", e))?;
+
+    String::from_utf8(plain).map_err(|e| format!("解密数据不是 UTF-8: {}", e))
+}
+
+// 接收端握手：
+// - 下发挑战 nonce；
+// - 校验对端返回的 HMAC；
+// - 返回 AUTH_OK + 会话随机数，并派生会话收发密钥。
+fn authenticate_client_connection(
+    stream: &mut TcpStream,
+    pair_code: &str,
+) -> Result<SessionKeys, String> {
+    let mut nonce = [0u8; 32];
+    OsRng.fill_bytes(&mut nonce);
+    let challenge = bytes_to_hex(&nonce);
+
+    stream
+        .write_all(format!("CHALLENGE {challenge}\n").as_bytes())
+        .map_err(|e| format!("发送挑战失败: {}", e))?;
+    stream
+        .flush()
+        .map_err(|e| format!("刷新挑战失败: {}", e))?;
+
+    let reader_stream = stream
+        .try_clone()
+        .map_err(|e| format!("复制连接失败: {}", e))?;
+    let mut reader = BufReader::new(reader_stream);
+
+    let mut line = String::new();
+    let read = reader
+        .read_line(&mut line)
+        .map_err(|e| format!("读取握手失败: {}", e))?;
+    if read == 0 {
+        return Err("握手失败：连接被关闭".to_string());
+    }
+
+    let Some(response_hex) = line.trim().strip_prefix(AUTH_PREFIX) else {
+        return Err("握手失败：协议不匹配".to_string());
+    };
+    let response_bytes = hex_to_bytes(response_hex)?;
+    let expected = build_hmac(pair_code, &nonce)?;
+
+    if constant_time_eq(&response_bytes, &expected) {
+        let mut client_random = [0u8; 32];
+        OsRng.fill_bytes(&mut client_random);
+
+        let mut material = Vec::with_capacity(nonce.len() + client_random.len());
+        material.extend_from_slice(&nonce);
+        material.extend_from_slice(&client_random);
+
+        let send_key = derive_session_key(pair_code, b"kms-c2s", &material)?;
+        let recv_key = derive_session_key(pair_code, b"kms-s2c", &material)?;
+
+        stream
+            .write_all(format!("{AUTH_OK} {}\n", bytes_to_hex(&client_random)).as_bytes())
+            .map_err(|e| format!("发送认证结果失败: {}", e))?;
+        stream
+            .flush()
+            .map_err(|e| format!("刷新认证结果失败: {}", e))?;
+        Ok(SessionKeys { send_key, recv_key })
+    } else {
+        let _ = stream.write_all(format!("{AUTH_FAIL}\n").as_bytes());
+        let _ = stream.flush();
+        Err("握手失败：配对码错误".to_string())
+    }
+}
+
+// 控制端握手：
+// - 接收挑战并计算 HMAC 回包；
+// - 读取 AUTH_OK/FAIL；
+// - 成功后使用双方随机材料派生会话收发密钥。
+fn authenticate_server_connection(
+    stream: &mut TcpStream,
+    pair_code: &str,
+) -> Result<SessionKeys, String> {
+    let reader_stream = stream
+        .try_clone()
+        .map_err(|e| format!("复制连接失败: {}", e))?;
+    let mut reader = BufReader::new(reader_stream);
+
+    let mut challenge = String::new();
+    let read = reader
+        .read_line(&mut challenge)
+        .map_err(|e| format!("读取挑战失败: {}", e))?;
+    if read == 0 {
+        return Err("握手失败：连接被关闭".to_string());
+    }
+
+    let Some(challenge_hex) = challenge.trim().strip_prefix("CHALLENGE ") else {
+        return Err("握手失败：挑战协议不匹配".to_string());
+    };
+
+    let nonce = hex_to_bytes(challenge_hex)?;
+    let response = build_hmac(pair_code, &nonce)?;
+    let request = format!("{AUTH_PREFIX}{}\n", bytes_to_hex(&response));
+
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("发送握手请求失败: {}", e))?;
+    stream
+        .flush()
+        .map_err(|e| format!("刷新握手请求失败: {}", e))?;
+
+    let mut auth_result = String::new();
+    let read = reader
+        .read_line(&mut auth_result)
+        .map_err(|e| format!("读取认证响应失败: {}", e))?;
+    if read == 0 {
+        return Err("握手失败：连接被关闭".to_string());
+    }
+
+    let response = auth_result.trim();
+    if response.starts_with(AUTH_OK) {
+        let mut parts = response.splitn(2, ' ');
+        let _ = parts.next();
+        let random_hex = parts
+            .next()
+            .ok_or_else(|| "握手失败：缺少会话随机数".to_string())?;
+        let client_random_vec = hex_to_bytes(random_hex)?;
+        if client_random_vec.len() != 32 {
+            return Err("握手失败：会话随机数长度不合法".to_string());
+        }
+
+        let mut material = Vec::with_capacity(nonce.len() + client_random_vec.len());
+        material.extend_from_slice(&nonce);
+        material.extend_from_slice(&client_random_vec);
+
+        let send_key = derive_session_key(pair_code, b"kms-s2c", &material)?;
+        let recv_key = derive_session_key(pair_code, b"kms-c2s", &material)?;
+
+        Ok(SessionKeys { send_key, recv_key })
+    } else {
+        match response {
+        AUTH_FAIL => Err("握手失败：配对码错误".to_string()),
+        other => Err(format!("握手失败：未知响应 {}", other)),
+        }
+    }
 }
 
 #[tauri::command]
-pub fn stop_sharing() {
+pub fn stop_sharing(app: AppHandle) {
+    // 通过共享开关通知所有工作线程尽快退出。
     let mut running = IS_RUNNING.lock().unwrap();
     *running = false;
+    drop(running);
+
+    let mut connected = IS_CONNECTED.lock().unwrap();
+    *connected = false;
+
+    emit_runtime_log(&app, "info", "共享已停止");
     println!("停止共享");
 }
 
 #[tauri::command]
-pub fn start_mouse_client(port: u16) {
+pub fn start_mouse_client(app: AppHandle, port: u16, pair_code: String) -> Result<(), String> {
+    // 先在命令入口做参数合法性校验，避免启动后才失败。
+    let pair_code = pair_code.trim().to_string();
+    validate_pair_code_strength(&pair_code)?;
+
     let mut running = IS_RUNNING.lock().unwrap();
     *running = true;
     drop(running);
 
+    emit_runtime_log(&app, "info", format!("客户端启动，监听端口 {}", port));
+
     let is_running = Arc::clone(&IS_RUNNING);
+    let app_handle = app.clone();
     thread::spawn(move || {
-        let listener = TcpListener::bind(("0.0.0.0", port)).unwrap();
+        // 客户端角色：监听端口，等待控制端接入。
+        let listener = match TcpListener::bind(("0.0.0.0", port)) {
+            Ok(listener) => listener,
+            Err(e) => {
+                emit_runtime_log(&app_handle, "error", format!("客户端监听失败: {}", e));
+                println!("[客户端] 监听端口失败: {}", e);
+                return;
+            }
+        };
+
+        if let Err(e) = listener.set_nonblocking(true) {
+            println!("[客户端] 设置监听非阻塞失败: {}", e);
+        }
+
         println!("客户端监听端口: {}", port);
 
         while *is_running.lock().unwrap() {
             match listener.accept() {
                 Ok((mut stream, addr)) => {
+                    let peer_ip = addr.ip();
+                    // 限流挡板：封禁窗口内直接拒绝连接，不进入握手流程。
+                    if let Some(remaining) = auth_block_remaining(peer_ip) {
+                        emit_runtime_log(
+                            &app_handle,
+                            "warn",
+                            format!(
+                                "拒绝 {} 的连接：鉴权失败过多，剩余锁定 {} 秒",
+                                peer_ip,
+                                remaining.as_secs()
+                            ),
+                        );
+                        let _ = stream.shutdown(Shutdown::Both);
+                        continue;
+                    }
+
                     println!("客户端已连接: {}", addr);
-                    let reader = BufReader::new(stream.try_clone().unwrap());
+                    emit_runtime_log(&app_handle, "info", format!("收到连接请求: {}", addr));
+
+                    let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
+                    let _ = stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
+
+                    // 握手失败计入限流；成功则清空失败历史。
+                    let session_keys = match authenticate_client_connection(&mut stream, &pair_code)
+                    {
+                        Ok(keys) => keys,
+                        Err(e) => {
+                            auth_record_failure(peer_ip);
+                            emit_runtime_log(
+                                &app_handle,
+                                "warn",
+                                format!("客户端鉴权失败（{}）: {}", peer_ip, e),
+                            );
+                            println!("[客户端] {}", e);
+                            let _ = stream.shutdown(Shutdown::Both);
+                            continue;
+                        }
+                    };
+                    auth_record_success(peer_ip);
+                    emit_runtime_log(&app_handle, "success", format!("客户端鉴权通过: {}", addr));
+
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+
+                    show_cursor();
+
+                    let reader_stream = match stream.try_clone() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            println!("[客户端] 复制连接失败: {}", e);
+                            continue;
+                        }
+                    };
+                    let mut reader = BufReader::new(reader_stream);
 
                     // 获取当前默认的鼠标初始位置
                     let (screen_width, screen_height) = display_size().unwrap_or((1920, 1080));
                     let (mut cur_x, mut cur_y) =
                         ((screen_width / 2) as i32, (screen_height / 2) as i32);
-
-                    // todo 确保客户端光标显示
-                    println!("[客户端] 调用 show_cursor()");
-
                     let max_x = screen_width as i32 - 1;
                     let max_y = screen_height as i32 - 1;
 
-                    for line in reader.lines() {
-                        let line = match line {
-                            Ok(l) => l,
-                            Err(_) => break,
-                        };
-                        if line.trim() == "RELEASE" {
-                            println!("[客户端] 收到 Release 信号，退出循环");
-                            break;
-                        }
-
-                        match serde_json::from_str::<AnyEvent>(&line) {
-                            Ok(AnyEvent::MouseEvent(evt)) => match evt.kind {
-                                MouseEventKind::MoveDelta { dx, dy } => {
-                                    cur_x = (cur_x + dx).clamp(0, max_x);
-                                    cur_y = (cur_y + dy).clamp(0, max_y);
-                                    println!(
-                                        "[客户端] 收到 Move dx={}, dy={}，移动到 ({}, {})",
-                                        dx, dy, cur_x, cur_y
-                                    );
-                                    move_cursor_to(cur_x, cur_y);
-                                    // 到达左边缘时通知服务端释放
-                                    if cur_x <= 1 {
-                                        let _ = stream.write_all(b"RELEASE\n");
-                                        println!("[客户端] 到达左边缘，已通知服务端释放控制权");
-                                    }
-                                }
-                                MouseEventKind::ButtonDown { button } => {
-                                    println!("[客户端] 收到 ButtonDown: {}", button);
-                                    simulate_button_down(&button);
-                                }
-                                MouseEventKind::ButtonUp { button } => {
-                                    println!("[客户端] 收到 ButtonUp: {}", button);
-                                    simulate_button_up(&button);
-                                }
-                                MouseEventKind::Wheel { delta } => {
-                                    println!("[客户端] 收到 Wheel: {}", delta);
-                                    simulate_wheel(delta);
-                                }
-                                _ => {}
-                            },
-                            Ok(AnyEvent::KeyEvent(evt)) => match evt.kind {
-                                KeyEventKind::KeyDown { key } => {
-                                    println!("[客户端] 收到 KeyDown: {}", key);
-                                    let res = std::panic::catch_unwind(|| simulate_key_down(&key));
-                                    if let Err(e) = res {
-                                        println!("simulate_key_down 崩溃: {:?}", e);
-                                    }
-                                }
-                                KeyEventKind::KeyUp { key } => {
-                                    println!("[客户端] 收到 KeyUp: {}", key);
-                                    let res = std::panic::catch_unwind(|| simulate_key_up(&key));
-                                    if let Err(e) = res {
-                                        println!("simulate_key_up 崩溃: {:?}", e);
-                                    }
-                                }
-                            },
-                            Err(e) => println!("[客户端] 解析数据错误: {}", e),
-                        }
-
+                    loop {
                         if !*is_running.lock().unwrap() {
-                            println!("[客户端] 共享已运行，退出循环");
+                            println!("[客户端] 共享已停止，退出连接循环");
                             break;
+                        }
+
+                        let mut line = String::new();
+                        match reader.read_line(&mut line) {
+                            Ok(0) => {
+                                println!("[客户端] 连接已关闭");
+                                break;
+                            }
+                            Ok(_) => {
+                                // 所有业务流量都要求先解密，解密失败立即断开。
+                                let payload = match decrypt_frame(&session_keys.recv_key, &line) {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        println!("[客户端] 解密数据失败: {}", e);
+                                        break;
+                                    }
+                                };
+
+                                if payload.trim() == "RELEASE" {
+                                    println!("[客户端] 收到 Release 信号，退出循环");
+                                    break;
+                                }
+
+                                match serde_json::from_str::<AnyEvent>(&payload) {
+                                    Ok(AnyEvent::MouseEvent(evt)) => match evt.kind {
+                                        MouseEventKind::MoveDelta { dx, dy } => {
+                                            cur_x = (cur_x + dx).clamp(0, max_x);
+                                            cur_y = (cur_y + dy).clamp(0, max_y);
+                                            move_cursor_to(cur_x, cur_y);
+
+                                            // 到达左边缘时通知服务端释放
+                                            if cur_x <= 1 {
+                                                match encrypt_frame(&session_keys.send_key, "RELEASE")
+                                                {
+                                                    Ok(frame) => {
+                                                        let _ = stream.write_all(frame.as_bytes());
+                                                        let _ = stream.flush();
+                                                        println!(
+                                                            "[客户端] 到达左边缘，已通知服务端释放控制权"
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        println!("[客户端] 发送 RELEASE 失败: {}", e);
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        MouseEventKind::ButtonDown { button } => {
+                                            simulate_button_down(&button);
+                                        }
+                                        MouseEventKind::ButtonUp { button } => {
+                                            simulate_button_up(&button);
+                                        }
+                                        MouseEventKind::Wheel { delta } => {
+                                            simulate_wheel(delta);
+                                        }
+                                        _ => {}
+                                    },
+                                    Ok(AnyEvent::KeyEvent(evt)) => match evt.kind {
+                                        KeyEventKind::KeyDown { key } => {
+                                            let res =
+                                                std::panic::catch_unwind(|| simulate_key_down(&key));
+                                            if let Err(e) = res {
+                                                println!("simulate_key_down 崩溃: {:?}", e);
+                                            }
+                                        }
+                                        KeyEventKind::KeyUp { key } => {
+                                            let res =
+                                                std::panic::catch_unwind(|| simulate_key_up(&key));
+                                            if let Err(e) = res {
+                                                println!("simulate_key_up 崩溃: {:?}", e);
+                                            }
+                                        }
+                                    },
+                                    Err(e) => println!("[客户端] 解析数据错误: {}", e),
+                                }
+                            }
+                            Err(e) if is_socket_timeout(&e) => continue,
+                            Err(e) => {
+                                println!("[客户端] 读取连接数据失败: {}", e);
+                                break;
+                            }
                         }
                     }
+
                     println!("[客户端] 连接断开或循环结束");
-                    let _ = stream.write_all(b"RELEASE\n");
-                    stream.flush().ok();
+                    // 结束前尽量通知控制端恢复本地光标状态。
+                    if let Ok(frame) = encrypt_frame(&session_keys.send_key, "RELEASE") {
+                        let _ = stream.write_all(frame.as_bytes());
+                    }
+                    let _ = stream.flush();
+                    let _ = stream.shutdown(Shutdown::Both);
                 }
-                Err(e) => println!("[客户端] 接受连接错误: {}", e),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => {
+                    println!("[客户端] 接受连接错误: {}", e);
+                    thread::sleep(Duration::from_millis(200));
+                }
             }
         }
     });
+    Ok(())
 }
 
 #[tauri::command]
-pub fn start_mouse_server(ip: String, port: u16) {
+pub fn start_mouse_server(
+    app: AppHandle,
+    ip: String,
+    port: u16,
+    pair_code: String,
+) -> Result<(), String> {
+    // 控制端角色：主动连接接收端并转发本机键鼠事件。
+    let pair_code = pair_code.trim().to_string();
+    validate_pair_code_strength(&pair_code)?;
+
     let mut running = IS_RUNNING.lock().unwrap();
     *running = true;
     drop(running);
 
+    emit_runtime_log(&app, "info", format!("控制端启动，目标 {}:{}", ip, port));
+
     let is_running = Arc::clone(&IS_RUNNING);
     let is_running_main = Arc::clone(&is_running);
+    let app_handle = app.clone();
     thread::spawn(move || {
         let (screen_width, screen_height) = display_size().unwrap_or((1920, 1080));
         let center_x = (screen_width / 2) as i32;
@@ -143,31 +647,36 @@ pub fn start_mouse_server(ip: String, port: u16) {
         let is_sharing = Arc::new(Mutex::new(false));
         let is_sharing_clone = Arc::clone(&is_sharing);
 
-        // 用于线程间传递dx/dy
-        let event_queue = Arc::new(Mutex::new(Vec::new()));
+        // 事件队列，按 FIFO 顺序发送
+        let event_queue = Arc::new(Mutex::new(VecDeque::new()));
         let event_queue_clone = Arc::clone(&event_queue);
 
         let pending_move = Arc::new(Mutex::new(None));
         let pending_move_clone = Arc::clone(&pending_move);
-        // 启动平台拖拽监听
+
         let (event_tx, event_rx) = channel();
         start_event_listener(event_tx);
-        // 该线程用来监听本地键鼠事件，并判断是否进入共享状态，更新位置和共享状态
+
+        // 本地输入采集线程：负责进入/退出共享态判断、事件排队。
         thread::spawn(move || {
             let mut last_x = center_x;
             let mut last_y = center_y;
+            let mut ignore_next_move = false;
+
             while let Ok(event) = event_rx.recv() {
                 if !*is_running.lock().unwrap() {
                     return;
                 }
-                // 只有已连接时才允许进入共享
+
+                // 未连接时不要退出监听线程，仅忽略事件
                 if !*IS_CONNECTED.lock().unwrap() {
-                    return;
+                    ignore_next_move = false;
+                    continue;
                 }
+
                 let mut sharing = is_sharing_clone.lock().unwrap();
 
                 // 先判断是否进入共享条件
-
                 if let AnyEvent::MouseEvent(MouseEvent {
                     kind: MouseEventKind::Move { x, .. },
                 }) = &event
@@ -178,10 +687,12 @@ pub fn start_mouse_server(ip: String, port: u16) {
                         hide_cursor();
                         move_cursor_to(center_x, center_y);
                         *sharing = true;
-                        // 进入共享锁住本地的键盘鼠标事件（除了鼠标移动）
-                        // std::thread::spawn(|| {
-                        //     block_local_input();
-                        // });
+
+                        // 重置增量基线，并忽略一次由 move_cursor_to 触发的合成移动事件
+                        last_x = center_x;
+                        last_y = center_y;
+                        ignore_next_move = true;
+                        continue;
                     }
                 };
 
@@ -194,9 +705,15 @@ pub fn start_mouse_server(ip: String, port: u16) {
                         AnyEvent::MouseEvent(MouseEvent {
                             kind: MouseEventKind::Move { x, y },
                         }) => {
+                            if ignore_next_move {
+                                last_x = *x;
+                                last_y = *y;
+                                ignore_next_move = false;
+                                continue;
+                            }
+
                             let dx = *x - last_x;
                             let dy = *y - last_y;
-                            println!("dx={}, dy={}", dx, dy);
                             if dx != 0 || dy != 0 {
                                 last_x = *x;
                                 last_y = *y;
@@ -208,50 +725,45 @@ pub fn start_mouse_server(ip: String, port: u16) {
                         AnyEvent::MouseEvent(MouseEvent {
                             kind: MouseEventKind::ButtonDown { button },
                         }) => {
-                            event_queue.push(AnyEvent::MouseEvent(MouseEvent {
+                            event_queue.push_back(AnyEvent::MouseEvent(MouseEvent {
                                 kind: MouseEventKind::ButtonDown {
                                     button: button.clone(),
                                 },
                             }));
-                            println!("收到 ButtonDown: {}", button);
                         }
                         // 鼠标抬起
                         AnyEvent::MouseEvent(MouseEvent {
                             kind: MouseEventKind::ButtonUp { button },
                         }) => {
-                            event_queue.push(AnyEvent::MouseEvent(MouseEvent {
+                            event_queue.push_back(AnyEvent::MouseEvent(MouseEvent {
                                 kind: MouseEventKind::ButtonUp {
                                     button: button.clone(),
                                 },
                             }));
-                            println!("收到 ButtonUp: {}", button);
                         }
                         // 鼠标滚轮
                         AnyEvent::MouseEvent(MouseEvent {
                             kind: MouseEventKind::Wheel { delta },
                         }) => {
-                            event_queue.push(AnyEvent::MouseEvent(MouseEvent {
+                            event_queue.push_back(AnyEvent::MouseEvent(MouseEvent {
                                 kind: MouseEventKind::Wheel { delta: *delta },
                             }));
-                            println!("收到 Wheel: {}", delta);
                         }
                         // 键盘按下
                         AnyEvent::KeyEvent(KeyEvent {
                             kind: KeyEventKind::KeyDown { key },
                         }) => {
-                            event_queue.push(AnyEvent::KeyEvent(KeyEvent {
+                            event_queue.push_back(AnyEvent::KeyEvent(KeyEvent {
                                 kind: KeyEventKind::KeyDown { key: key.clone() },
                             }));
-                            println!("收到 KeyDown: {}", key);
                         }
                         // 键盘抬起
                         AnyEvent::KeyEvent(KeyEvent {
                             kind: KeyEventKind::KeyUp { key },
                         }) => {
-                            event_queue.push(AnyEvent::KeyEvent(KeyEvent {
+                            event_queue.push_back(AnyEvent::KeyEvent(KeyEvent {
                                 kind: KeyEventKind::KeyUp { key: key.clone() },
                             }));
-                            println!("收到 KeyUp: {}", key);
                         }
                         _ => {}
                     }
@@ -259,7 +771,7 @@ pub fn start_mouse_server(ip: String, port: u16) {
             }
         });
 
-        // 主循环：负责连接、同步数据、切换光标
+        // 连接主循环：负责重连、握手、加密发送事件、接收 RELEASE。
         while *is_running_main.lock().unwrap() {
             println!("尝试连接到 {}:{}", ip, port);
             let ip_addr: IpAddr = ip
@@ -268,82 +780,144 @@ pub fn start_mouse_server(ip: String, port: u16) {
 
             match TcpStream::connect_timeout(&(ip_addr, port).into(), Duration::from_secs(2)) {
                 Ok(mut stream) => {
+                    let _ = stream.set_nodelay(true);
+                    let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
+                    let _ = stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
+
+                    // 每次新连接都先完成握手并派生本次会话密钥。
+                    let session_keys = match authenticate_server_connection(&mut stream, &pair_code)
+                    {
+                        Ok(keys) => keys,
+                        Err(e) => {
+                            emit_runtime_log(&app_handle, "warn", format!("控制端鉴权失败: {}", e));
+                            println!("[控制端] {}", e);
+                            let _ = stream.shutdown(Shutdown::Both);
+                            thread::sleep(Duration::from_secs(1));
+                            continue;
+                        }
+                    };
+
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+
                     {
                         let mut connected = IS_CONNECTED.lock().unwrap();
                         *connected = true;
                     }
-                    println!("已连接到服务器");
+                    emit_runtime_log(&app_handle, "success", "控制端连接成功，鉴权通过");
+                    println!("已连接到服务器，鉴权通过");
 
                     let is_sharing_recv = Arc::clone(&is_sharing);
-                    let mut buf_reader = BufReader::new(stream.try_clone().unwrap());
+                    let is_running_recv = Arc::clone(&is_running_main);
+                    let recv_key = session_keys.recv_key;
+                    let reader_stream = match stream.try_clone() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            println!("复制连接失败: {}", e);
+                            let mut connected = IS_CONNECTED.lock().unwrap();
+                            *connected = false;
+                            continue;
+                        }
+                    };
 
-                    // 该线程用来监听客户端释放信号
-                    thread::spawn(move || loop {
-                        let mut buf = String::new();
-                        match buf_reader.read_line(&mut buf) {
-                            Ok(n) => {
-                                if n > 0 && buf.trim() == "RELEASE" {
-                                    let mut sharing = is_sharing_recv.lock().unwrap();
-                                    *sharing = false;
-                                    show_cursor();
-                                    println!("收到客户端释放信号，恢复本机光标");
-                                    // unblock_local_input();
-                                    println!("已恢复本地键盘和鼠标按键输入");
-                                } else if n == 0 {
+                    // 读取线程：监听远端 RELEASE（已加密）以结束共享态。
+                    thread::spawn(move || {
+                        let _ = reader_stream.set_read_timeout(Some(Duration::from_millis(200)));
+                        let mut buf_reader = BufReader::new(reader_stream);
+
+                        loop {
+                            if !*is_running_recv.lock().unwrap() {
+                                break;
+                            }
+
+                            let mut buf = String::new();
+                            match buf_reader.read_line(&mut buf) {
+                                Ok(0) => {
                                     println!("客户端连接已关闭");
                                     break;
                                 }
-                            }
-                            Err(e) => {
-                                println!("接收客户端消息出错: {}", e);
-                                break;
+                                Ok(_) => {
+                                    let payload = match decrypt_frame(&recv_key, &buf) {
+                                        Ok(p) => p,
+                                        Err(e) => {
+                                            println!("接收客户端加密消息失败: {}", e);
+                                            break;
+                                        }
+                                    };
+
+                                    if payload.trim() == "RELEASE" {
+                                        let mut sharing = is_sharing_recv.lock().unwrap();
+                                        *sharing = false;
+                                        show_cursor();
+                                        println!("收到客户端释放信号，恢复本机光标");
+                                    }
+                                }
+                                Err(e) if is_socket_timeout(&e) => continue,
+                                Err(e) => {
+                                    println!("接收客户端消息出错: {}", e);
+                                    break;
+                                }
                             }
                         }
                     });
 
-                    // 服务端启动后，是否共享过
+                    // 用于检测共享态从 true -> false 的边沿，触发光标恢复。
                     let mut last_sharing = false;
+                    let mut connection_broken = false;
 
                     while *is_running_main.lock().unwrap() {
                         let sharing = *is_sharing.lock().unwrap();
 
                         if !sharing && last_sharing {
-                            println!("调用 mac_cursor::show_cursor()");
                             show_cursor();
-                            // unblock_local_input();
                         }
                         last_sharing = sharing;
 
-                        // 共享状态下发送dx/dy
+                        // 共享状态下发送 dx/dy
                         if sharing {
                             let mut event_queue = event_queue.lock().unwrap();
 
-                            // 每 1~3ms 发送一次
                             if let Some((dx, dy)) = pending_move.lock().unwrap().take() {
-                                event_queue.push(AnyEvent::MouseEvent(MouseEvent {
+                                event_queue.push_back(AnyEvent::MouseEvent(MouseEvent {
                                     kind: MouseEventKind::MoveDelta { dx, dy },
                                 }));
                             }
 
-                            // 发送队列中的所有事件
-                            while let Some(evt) = event_queue.pop() {
-                                println!("准备发送事件: {:?}", evt);
-                                let msg = serde_json::to_string(&evt).unwrap() + "\n";
-                                println!("发送键鼠鼠标数据: {}", msg);
-                                if let Err(e) = stream.write_all(msg.as_bytes()) {
+                            // 发送队列中的所有事件（FIFO + 加密帧）。
+                            while let Some(evt) = event_queue.pop_front() {
+                                let plain = serde_json::to_string(&evt).unwrap();
+                                let frame = match encrypt_frame(&session_keys.send_key, &plain) {
+                                    Ok(frame) => frame,
+                                    Err(e) => {
+                                        println!("事件加密失败: {}", e);
+                                        connection_broken = true;
+                                        break;
+                                    }
+                                };
+
+                                if let Err(e) = stream.write_all(frame.as_bytes()) {
                                     println!("发送键鼠鼠标数据错误: {}", e);
+                                    connection_broken = true;
                                     break;
                                 }
-                                stream.flush().ok();
+                                let _ = stream.flush();
                             }
+                        }
+
+                        if connection_broken {
+                            break;
                         }
 
                         thread::sleep(Duration::from_millis(10));
                     }
+
                     // 断开连接时恢复光标
                     show_cursor();
-                    let _ = stream.write_all(b"RELEASE\n");
+                    if let Ok(frame) = encrypt_frame(&session_keys.send_key, "RELEASE") {
+                        let _ = stream.write_all(frame.as_bytes());
+                    }
                     let _ = stream.flush();
+                    let _ = stream.shutdown(Shutdown::Both);
                     {
                         let mut connected = IS_CONNECTED.lock().unwrap();
                         *connected = false;
@@ -353,13 +927,19 @@ pub fn start_mouse_server(ip: String, port: u16) {
                     // 连接失败时确保 is_connected 为 false
                     let mut connected = IS_CONNECTED.lock().unwrap();
                     *connected = false;
-                    println!("连接失败: {}, 2秒后重试", e);
+                    emit_runtime_log(&app_handle, "warn", format!("连接失败: {}", e));
+                    println!("连接失败: {}, 2 秒后重试", e);
+
+                    if !*is_running_main.lock().unwrap() {
+                        break;
+                    }
                     thread::sleep(Duration::from_secs(2));
                 }
             }
         }
-        // 线程退出时恢复光标和本地键鼠事件
+
+        // 线程退出时恢复光标
         show_cursor();
-        // unblock_local_input();
     });
+    Ok(())
 }

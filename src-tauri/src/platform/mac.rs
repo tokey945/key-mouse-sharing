@@ -9,9 +9,6 @@ use core_foundation::boolean::kCFBooleanTrue;
 use core_foundation::string::CFString;
 #[cfg(target_os = "macos")]
 use core_graphics::display::{CGDisplayHideCursor, CGDisplayShowCursor, CGMainDisplayID};
-use core_graphics::event::CGEventField;
-use rdev::Event;
-use std::sync::Arc;
 #[cfg(target_os = "macos")]
 use std::sync::Once;
 #[cfg(target_os = "macos")]
@@ -24,9 +21,6 @@ use core_foundation::runloop::{
 };
 #[cfg(target_os = "macos")]
 use core_foundation_sys::base::kCFAllocatorDefault;
-use core_foundation_sys::runloop::CFRunLoopAddTimer;
-use core_foundation_sys::runloop::CFRunLoopStop;
-use core_foundation_sys::runloop::CFRunLoopTimerContext;
 #[cfg(target_os = "macos")]
 use core_graphics::event::CGEventType;
 #[cfg(target_os = "macos")]
@@ -45,9 +39,6 @@ use std::sync::mpsc::Sender;
 use std::sync::Mutex;
 #[allow(non_camel_case_types)]
 enum __CGEvent {}
-
-#[cfg(target_os = "macos")]
-use core_foundation_sys::runloop::CFRunLoopTimerRef;
 
 #[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -131,14 +122,13 @@ fn cg_event_mask_bit(event_type: CGEventType) -> CGEventMask {
     1u64 << (event_type as u32)
 }
 
-static mut TAP: Option<CFMachPortRef> = None;
-static TAP_MUTEX: Mutex<()> = Mutex::new(());
+static TAP_HANDLE: Mutex<Option<usize>> = Mutex::new(None);
 
 /// 屏蔽本地键盘和鼠标按键输入（不影响鼠标移动）
 pub fn block_local_input() {
-    let _guard = TAP_MUTEX.lock().unwrap();
+    let mut tap_guard = TAP_HANDLE.lock().unwrap();
     unsafe {
-        if let Some(_) = TAP {
+        if tap_guard.is_some() {
             return;
         }
 
@@ -193,7 +183,8 @@ pub fn block_local_input() {
         );
 
         CGEventTapEnable(tap, true);
-        TAP = Some(tap);
+        *tap_guard = Some(tap as usize);
+        drop(tap_guard);
 
         println!("已屏蔽本地键盘和鼠标按键输入（macOS）");
 
@@ -204,13 +195,14 @@ pub fn block_local_input() {
 
 /// 恢复本地输入
 pub fn unblock_local_input() {
-    let _guard = TAP_MUTEX.lock().unwrap();
-    unsafe {
-        if let Some(tap) = TAP.take() {
+    let mut tap_guard = TAP_HANDLE.lock().unwrap();
+    if let Some(raw_tap) = tap_guard.take() {
+        let tap = raw_tap as CFMachPortRef;
+        unsafe {
             CGEventTapEnable(tap, false);
             CFRelease(tap as *const c_void);
-            println!("已恢复本地键盘和鼠标按键输入（macOS）");
         }
+        println!("已恢复本地键盘和鼠标按键输入（macOS）");
     }
 }
 
@@ -382,26 +374,30 @@ pub fn start_event_listener(tx: Sender<AnyEvent>) {
                     CGEventType::KeyDown => {
                         let keycode =
                             event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
-                        if keycode != 0 {
-                            let key_str = keycode_to_string(keycode);
-                            let _ = tx.send(AnyEvent::KeyEvent(KeyEvent {
-                                kind: KeyEventKind::KeyDown {
-                                    key: key_str.to_string(),
-                                },
-                            }));
-                        }
+                        let key_str = keycode_to_string(keycode);
+                        let key = if key_str == "Unknown" {
+                            format!("Unknown({})", keycode)
+                        } else {
+                            key_str.to_string()
+                        };
+
+                        let _ = tx.send(AnyEvent::KeyEvent(KeyEvent {
+                            kind: KeyEventKind::KeyDown { key },
+                        }));
                     }
                     CGEventType::KeyUp => {
                         let keycode =
                             event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
-                        if keycode != 0 {
-                            let key_str = keycode_to_string(keycode);
-                            let _ = tx.send(AnyEvent::KeyEvent(KeyEvent {
-                                kind: KeyEventKind::KeyUp {
-                                    key: key_str.to_string(),
-                                },
-                            }));
-                        }
+                        let key_str = keycode_to_string(keycode);
+                        let key = if key_str == "Unknown" {
+                            format!("Unknown({})", keycode)
+                        } else {
+                            key_str.to_string()
+                        };
+
+                        let _ = tx.send(AnyEvent::KeyEvent(KeyEvent {
+                            kind: KeyEventKind::KeyUp { key },
+                        }));
                     }
                     CGEventType::LeftMouseDragged | CGEventType::RightMouseDragged => {
                         let loc = event.location();
