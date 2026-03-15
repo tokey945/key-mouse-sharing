@@ -489,129 +489,113 @@ pub fn start_mouse_server(
         let center_y = (screen_height / 2) as i32;
 
         let is_sharing = Arc::new(Mutex::new(false));
-        let is_sharing_clone = Arc::clone(&is_sharing);
+        let is_sharing_for_listener = Arc::clone(&is_sharing);
+        let is_sharing_for_timer = Arc::clone(&is_sharing);
 
         // 事件队列，按 FIFO 顺序发送
         let event_queue = Arc::new(Mutex::new(VecDeque::new()));
-        let event_queue_clone = Arc::clone(&event_queue);
+        let event_queue_for_listener = Arc::clone(&event_queue);
+        let event_queue_for_timer = Arc::clone(&event_queue);
+        let event_queue_for_sender = Arc::clone(&event_queue);
 
-        let pending_move = Arc::new(Mutex::new(None));
-        let pending_move_clone = Arc::clone(&pending_move);
+        // 当前鼠标位置（用于定时器线程读取）
+        let current_pos = Arc::new(Mutex::new((center_x, center_y)));
+        let current_pos_for_listener = Arc::clone(&current_pos);
+        let current_pos_for_timer = Arc::clone(&current_pos);
+
+        // 定时器重置位置基准
+        let reset_base = Arc::new(Mutex::new((center_x, center_y)));
+        let reset_base_for_listener = Arc::clone(&reset_base);
+        let reset_base_for_timer = Arc::clone(&reset_base);
+
+        let is_running_for_listener = Arc::clone(&is_running);
+        let is_running_for_timer = Arc::clone(&is_running);
 
         let (event_tx, event_rx) = channel();
         start_event_listener(event_tx);
 
-        // 本地输入采集线程：负责进入/退出共享态判断、事件排队。
+        // 线程1：只负责监听鼠标移动事件，更新当前光标位置
         thread::spawn(move || {
-            let mut last_x = center_x;
-            let mut last_y = center_y;
-            let mut ignore_next_move = false;
-
             while let Ok(event) = event_rx.recv() {
-                if !*is_running.lock().unwrap() {
+                if !*is_running_for_listener.lock().unwrap() {
                     return;
                 }
 
-                // 未连接时不要退出监听线程，仅忽略事件
+                // 未连接时忽略事件
                 if !*IS_CONNECTED.lock().unwrap() {
-                    ignore_next_move = false;
                     continue;
                 }
 
-                let mut sharing = is_sharing_clone.lock().unwrap();
-
-                // 先判断是否进入共享条件
+                // 判断是否进入共享
                 if let AnyEvent::MouseEvent(MouseEvent {
-                    kind: MouseEventKind::Move { x, .. },
+                    kind: MouseEventKind::Move { x, y },
                 }) = &event
                 {
-                    // 只有未共享且到达右边缘时才进入共享
+                    let mut sharing = is_sharing_for_listener.lock().unwrap();
                     if *x >= (screen_width as i32 - 1) && !*sharing {
                         println!("进入共享状态，隐藏光标并置于中心");
-                        hide_cursor();
                         move_cursor_to(center_x, center_y);
                         *sharing = true;
-
-                        // 重置增量基线，并忽略一次由 move_cursor_to 触发的合成移动事件
-                        last_x = center_x;
-                        last_y = center_y;
-                        ignore_next_move = true;
+                        // 重置基准
+                        *reset_base_for_listener.lock().unwrap() = (center_x, center_y);
+                        *current_pos_for_listener.lock().unwrap() = (center_x, center_y);
                         continue;
                     }
-                };
+                    drop(sharing);
 
-                // 共享状态下，计算相对移动并重置鼠标
-                if *sharing {
-                    let mut event_queue = event_queue_clone.lock().unwrap();
-
-                    match &event {
-                        // 鼠标移动（绝对坐标）
-                        AnyEvent::MouseEvent(MouseEvent {
-                            kind: MouseEventKind::Move { x, y },
-                        }) => {
-                            if ignore_next_move {
-                                last_x = *x;
-                                last_y = *y;
-                                ignore_next_move = false;
-                                continue;
-                            }
-
-                            let dx = *x - last_x;
-                            let dy = *y - last_y;
-                            if dx != 0 || dy != 0 {
-                                last_x = *x;
-                                last_y = *y;
-                                *pending_move_clone.lock().unwrap() = Some((dx, dy));
-                                move_cursor_to(center_x, center_y);
-                            }
-                        }
-                        // 鼠标按下
-                        AnyEvent::MouseEvent(MouseEvent {
-                            kind: MouseEventKind::ButtonDown { button },
-                        }) => {
-                            event_queue.push_back(AnyEvent::MouseEvent(MouseEvent {
-                                kind: MouseEventKind::ButtonDown {
-                                    button: button.clone(),
-                                },
-                            }));
-                        }
-                        // 鼠标抬起
-                        AnyEvent::MouseEvent(MouseEvent {
-                            kind: MouseEventKind::ButtonUp { button },
-                        }) => {
-                            event_queue.push_back(AnyEvent::MouseEvent(MouseEvent {
-                                kind: MouseEventKind::ButtonUp {
-                                    button: button.clone(),
-                                },
-                            }));
-                        }
-                        // 鼠标滚轮
-                        AnyEvent::MouseEvent(MouseEvent {
-                            kind: MouseEventKind::Wheel { delta },
-                        }) => {
-                            event_queue.push_back(AnyEvent::MouseEvent(MouseEvent {
-                                kind: MouseEventKind::Wheel { delta: *delta },
-                            }));
-                        }
-                        // 键盘按下
-                        AnyEvent::KeyEvent(KeyEvent {
-                            kind: KeyEventKind::KeyDown { key },
-                        }) => {
-                            event_queue.push_back(AnyEvent::KeyEvent(KeyEvent {
-                                kind: KeyEventKind::KeyDown { key: key.clone() },
-                            }));
-                        }
-                        // 键盘抬起
-                        AnyEvent::KeyEvent(KeyEvent {
-                            kind: KeyEventKind::KeyUp { key },
-                        }) => {
-                            event_queue.push_back(AnyEvent::KeyEvent(KeyEvent {
-                                kind: KeyEventKind::KeyUp { key: key.clone() },
-                            }));
-                        }
-                        _ => {}
-                    }
+                    // 只更新当前位置
+                    *current_pos_for_listener.lock().unwrap() = (*x, *y);
+                } else {
+                    // 按钮、键盘、滚轮事件直接发送到队列
+                    event_queue_for_listener.lock().unwrap().push_back(event);
                 }
+            }
+        });
+
+        // 线程2：定时器，每隔固定时间重置鼠标到中心并发送位移
+        thread::spawn(move || {
+            loop {
+                if !*is_running_for_timer.lock().unwrap() {
+                    return;
+                }
+
+                let sharing = is_sharing_for_timer.lock().unwrap();
+                if !*sharing {
+                    drop(sharing);
+                    thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                drop(sharing);
+
+                // 获取当前位置
+                let (curr_x, curr_y) = *current_pos_for_timer.lock().unwrap();
+
+                // 获取上次重置的基准位置
+                let (base_x, base_y) = *reset_base_for_timer.lock().unwrap();
+
+                // 计算相对位移
+                let dx = curr_x - base_x;
+                let dy = curr_y - base_y;
+
+                if dx != 0 || dy != 0 {
+                    // 发送位移到队列
+                    event_queue_for_timer
+                        .lock()
+                        .unwrap()
+                        .push_back(AnyEvent::MouseEvent(MouseEvent {
+                            kind: MouseEventKind::MoveDelta { dx, dy },
+                        }));
+                }
+
+                // 重置鼠标到中心
+                move_cursor_to(center_x, center_y);
+
+                // 更新基准位置
+                *reset_base_for_timer.lock().unwrap() = (center_x, center_y);
+                *current_pos_for_timer.lock().unwrap() = (center_x, center_y);
+
+                // 固定间隔 1ms
+                thread::sleep(Duration::from_millis(1));
             }
         });
 
@@ -727,39 +711,11 @@ pub fn start_mouse_server(
                         }
                         last_sharing = sharing;
 
-                        // 共享状态下发送 dx/dy
+                        // 共享状态下发送队列中的所有事件
                         if sharing {
-                            let mut event_queue = event_queue.lock().unwrap();
+                            let mut event_queue = event_queue_for_sender.lock().unwrap();
 
-                            // 批量合并鼠标移动事件，减少网络往返次数
-                            let mut total_dx = 0;
-                            let mut total_dy = 0;
-                            while let Some((dx, dy)) = pending_move.lock().unwrap().take() {
-                                total_dx += dx;
-                                total_dy += dy;
-                            }
-
-                            // 只有当累积的移动超过阈值时才发送，减少小移动的延迟感
-                            if total_dx != 0 || total_dy != 0 {
-                                // 直接发送单个移动事件以保持平滑
-                                let plain =
-                                    serde_json::to_string(&AnyEvent::MouseEvent(MouseEvent {
-                                        kind: MouseEventKind::MoveDelta {
-                                            dx: total_dx,
-                                            dy: total_dy,
-                                        },
-                                    }))
-                                    .unwrap();
-                                let frame = encode_frame(&plain);
-
-                                if let Err(e) = stream.write_all(frame.as_bytes()) {
-                                    println!("发送键鼠鼠标数据错误: {}", e);
-                                    connection_broken = true;
-                                    break;
-                                }
-                            }
-
-                            // 发送队列中的其他事件（按键、滚轮等）
+                            // 发送队列中的所有事件（鼠标移动、按键、滚轮等）
                             let mut batch_data = Vec::new();
                             while let Some(evt) = event_queue.pop_front() {
                                 let plain = serde_json::to_string(&evt).unwrap();
