@@ -1,7 +1,15 @@
 use enigo::MouseButton;
 use enigo::MouseControllable;
 use enigo::{Enigo, KeyboardControllable};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
+
+static ENIGO: Lazy<Mutex<Enigo>> = Lazy::new(|| Mutex::new(Enigo::new()));
+
+pub fn get_enigo() -> std::sync::MutexGuard<'static, Enigo> {
+    ENIGO.lock().unwrap()
+}
 
 // 传输层统一事件模型：控制端采集后序列化发送，接收端反序列化执行。
 #[derive(Serialize, Deserialize, Debug)]
@@ -43,13 +51,12 @@ pub fn show_cursor() {
     crate::platform::show_cursor();
 }
 pub fn move_cursor_to(x: i32, y: i32) {
-    // enigo 在不同平台上有自己的坐标体系，这里统一由调用方做边界控制。
-    let mut enigo = enigo::Enigo::new();
+    let mut enigo = get_enigo();
     enigo.mouse_move_to(x, y);
 }
 
 pub fn simulate_button_down(button: &str) {
-    let mut enigo = enigo::Enigo::new();
+    let mut enigo = get_enigo();
     match button {
         "Left" | "Button1" => enigo.mouse_down(MouseButton::Left),
         "Right" | "Button2" => enigo.mouse_down(MouseButton::Right),
@@ -59,7 +66,7 @@ pub fn simulate_button_down(button: &str) {
 }
 
 pub fn simulate_button_up(button: &str) {
-    let mut enigo = enigo::Enigo::new();
+    let mut enigo = get_enigo();
     match button {
         "Left" | "Button1" => enigo.mouse_up(MouseButton::Left),
         "Right" | "Button2" => enigo.mouse_up(MouseButton::Right),
@@ -69,21 +76,20 @@ pub fn simulate_button_up(button: &str) {
 }
 
 pub fn simulate_wheel(delta: i32) {
-    let mut enigo = enigo::Enigo::new();
+    let mut enigo = get_enigo();
     enigo.mouse_scroll_y(delta);
 }
 
 pub fn simulate_key_down(key: &str) {
-    // 未识别按键直接忽略，避免 panic 影响主循环。
     if let Some(k) = str_to_enigo_key(key) {
-        let mut enigo = Enigo::new();
+        let mut enigo = get_enigo();
         enigo.key_down(k);
     }
 }
 
 pub fn simulate_key_up(key: &str) {
     if let Some(k) = str_to_enigo_key(key) {
-        let mut enigo = Enigo::new();
+        let mut enigo = get_enigo();
         enigo.key_up(k);
     }
 }

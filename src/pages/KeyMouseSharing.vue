@@ -255,7 +255,7 @@ const stop = async () => {
 
     <div class="grid w-full max-w-sm items-center gap-1.5">
       <Label for="pair-code">配对码：</Label>
-      <Input id="pair-code" v-model="pairCode" type="password" class="w-56 focus-visible:ring-0" />
+      <Input id="pair-code" v-model="pairCode" class="w-56 focus-visible:ring-0" />
     </div>
 
     <div class="space-x-4">

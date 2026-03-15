@@ -28,10 +28,8 @@ enigo = "0.1.0"
 rdev = "0.5"
 tauri-plugin-dialog = "2"
 lazy_static = "1.4"
-hmac = "0.12"
-sha2 = "0.10"
 rand = "0.8"
-chacha20poly1305 = "0.10"
+once_cell = "1.19"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.25.0"

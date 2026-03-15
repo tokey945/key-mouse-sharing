@@ -3,7 +3,6 @@ use std::ptr;
 use std::sync::mpsc::Sender;
 use std::sync::Mutex;
 use winapi::shared::minwindef::{LPARAM, WPARAM};
-use winapi::shared::windef::{HCURSOR, POINT};
 use winapi::um::winuser::{
     CallNextHookEx, SetWindowsHookExW, ShowCursor, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
 };
@@ -30,12 +29,13 @@ pub fn show_cursor() {
     }
 }
 
-// 用裸指针类型替代 HHOOK
+#[allow(static_mut_refs)]
 static mut HOOK_HANDLE: Option<(*mut std::ffi::c_void, *mut std::ffi::c_void)> = None;
 static HOOK_MUTEX: Mutex<()> = Mutex::new(());
 
 /// 屏蔽本地键盘和鼠标按键输入（不影响鼠标移动）
 #[cfg(target_os = "windows")]
+#[allow(static_mut_refs)]
 pub fn block_local_input() {
     let _guard = HOOK_MUTEX.lock().unwrap();
 
@@ -67,6 +67,7 @@ pub fn block_local_input() {
 
 /// 恢复本地输入
 #[cfg(target_os = "windows")]
+#[allow(static_mut_refs)]
 pub fn unblock_local_input() {
     let _guard = HOOK_MUTEX.lock().unwrap();
 
@@ -220,6 +221,7 @@ pub fn str_to_enigo_key(key: &str) -> Option<enigo::Key> {
     }
 }
 
+#[allow(dead_code)]
 #[cfg(target_os = "windows")]
 pub fn start_drag_listener(tx: Sender<(f64, f64)>) {
     std::thread::spawn(move || {
@@ -241,48 +243,50 @@ pub fn start_drag_listener(tx: Sender<(f64, f64)>) {
 
 pub fn start_event_listener(tx: Sender<AnyEvent>) {
     std::thread::spawn(move || {
-        use rdev::{listen, Button, Event, EventType};
-        let callback = move |event: Event| {
-            match event.event_type {
-                EventType::MouseMove { x, y } => {
-                    // 这里只做相对移动，dx/dy 交给 mouse_share.rs
-                }
-                EventType::ButtonPress(btn) => {
-                    let _ = tx.send(AnyEvent::MouseEvent(MouseEvent {
-                        kind: MouseEventKind::ButtonDown {
-                            button: format!("{:?}", btn),
-                        },
-                    }));
-                }
-                EventType::ButtonRelease(btn) => {
-                    let _ = tx.send(AnyEvent::MouseEvent(MouseEvent {
-                        kind: MouseEventKind::ButtonUp {
-                            button: format!("{:?}", btn),
-                        },
-                    }));
-                }
-                EventType::Wheel { delta_y, .. } => {
-                    let _ = tx.send(AnyEvent::MouseEvent(MouseEvent {
-                        kind: MouseEventKind::Wheel {
-                            delta: delta_y as i32,
-                        },
-                    }));
-                }
-                EventType::KeyPress(key) => {
-                    let _ = tx.send(AnyEvent::KeyEvent(KeyEvent {
-                        kind: KeyEventKind::KeyDown {
-                            key: format!("{:?}", key),
-                        },
-                    }));
-                }
-                EventType::KeyRelease(key) => {
-                    let _ = tx.send(AnyEvent::KeyEvent(KeyEvent {
-                        kind: KeyEventKind::KeyUp {
-                            key: format!("{:?}", key),
-                        },
-                    }));
-                }
-                _ => {}
+        use rdev::{listen, Event, EventType};
+        let callback = move |event: Event| match event.event_type {
+            EventType::MouseMove { x, y } => {
+                let _ = tx.send(AnyEvent::MouseEvent(MouseEvent {
+                    kind: MouseEventKind::Move {
+                        x: x as i32,
+                        y: y as i32,
+                    },
+                }));
+            }
+            EventType::ButtonPress(btn) => {
+                let _ = tx.send(AnyEvent::MouseEvent(MouseEvent {
+                    kind: MouseEventKind::ButtonDown {
+                        button: format!("{:?}", btn),
+                    },
+                }));
+            }
+            EventType::ButtonRelease(btn) => {
+                let _ = tx.send(AnyEvent::MouseEvent(MouseEvent {
+                    kind: MouseEventKind::ButtonUp {
+                        button: format!("{:?}", btn),
+                    },
+                }));
+            }
+            EventType::Wheel { delta_y, .. } => {
+                let _ = tx.send(AnyEvent::MouseEvent(MouseEvent {
+                    kind: MouseEventKind::Wheel {
+                        delta: delta_y as i32,
+                    },
+                }));
+            }
+            EventType::KeyPress(key) => {
+                let _ = tx.send(AnyEvent::KeyEvent(KeyEvent {
+                    kind: KeyEventKind::KeyDown {
+                        key: format!("{:?}", key),
+                    },
+                }));
+            }
+            EventType::KeyRelease(key) => {
+                let _ = tx.send(AnyEvent::KeyEvent(KeyEvent {
+                    kind: KeyEventKind::KeyUp {
+                        key: format!("{:?}", key),
+                    },
+                }));
             }
         };
         listen(callback).unwrap();
