@@ -1,14 +1,18 @@
 use enigo::MouseButton;
 use enigo::MouseControllable;
 use enigo::{Enigo, KeyboardControllable};
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use std::cell::RefCell;
 
-static ENIGO: Lazy<Mutex<Enigo>> = Lazy::new(|| Mutex::new(Enigo::new()));
+thread_local! {
+    static ENIGO: RefCell<Enigo> = RefCell::new(Enigo::new());
+}
 
-pub fn get_enigo() -> std::sync::MutexGuard<'static, Enigo> {
-    ENIGO.lock().unwrap()
+fn with_enigo<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut Enigo) -> R,
+{
+    ENIGO.with(|cell| f(&mut cell.borrow_mut()))
 }
 
 // 传输层统一事件模型：控制端采集后序列化发送，接收端反序列化执行。
@@ -51,46 +55,48 @@ pub fn show_cursor() {
     crate::platform::show_cursor();
 }
 pub fn move_cursor_to(x: i32, y: i32) {
-    let mut enigo = get_enigo();
-    enigo.mouse_move_to(x, y);
+    with_enigo(|enigo| {
+        enigo.mouse_move_to(x, y);
+    });
 }
 
 pub fn simulate_button_down(button: &str) {
-    let mut enigo = get_enigo();
-    match button {
+    with_enigo(|enigo| match button {
         "Left" | "Button1" => enigo.mouse_down(MouseButton::Left),
         "Right" | "Button2" => enigo.mouse_down(MouseButton::Right),
         "Middle" | "Button3" => enigo.mouse_down(MouseButton::Middle),
         _ => {}
-    }
+    });
 }
 
 pub fn simulate_button_up(button: &str) {
-    let mut enigo = get_enigo();
-    match button {
+    with_enigo(|enigo| match button {
         "Left" | "Button1" => enigo.mouse_up(MouseButton::Left),
         "Right" | "Button2" => enigo.mouse_up(MouseButton::Right),
         "Middle" | "Button3" => enigo.mouse_up(MouseButton::Middle),
         _ => {}
-    }
+    });
 }
 
 pub fn simulate_wheel(delta: i32) {
-    let mut enigo = get_enigo();
-    enigo.mouse_scroll_y(delta);
+    with_enigo(|enigo| {
+        enigo.mouse_scroll_y(delta);
+    });
 }
 
 pub fn simulate_key_down(key: &str) {
     if let Some(k) = str_to_enigo_key(key) {
-        let mut enigo = get_enigo();
-        enigo.key_down(k);
+        with_enigo(|enigo| {
+            enigo.key_down(k);
+        });
     }
 }
 
 pub fn simulate_key_up(key: &str) {
     if let Some(k) = str_to_enigo_key(key) {
-        let mut enigo = get_enigo();
-        enigo.key_up(k);
+        with_enigo(|enigo| {
+            enigo.key_up(k);
+        });
     }
 }
 

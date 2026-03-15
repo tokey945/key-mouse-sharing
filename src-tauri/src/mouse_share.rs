@@ -247,7 +247,7 @@ pub fn start_mouse_client(app: AppHandle, port: u16, pair_code: String) -> Resul
     let app_handle = app.clone();
     thread::spawn(move || {
         // 客户端角色：监听端口，等待控制端接入。
-        let listener = match TcpListener::bind(("0.0.0.0", port)) {
+        let listener = match TcpListener::bind(("::", port)) {
             Ok(listener) => listener,
             Err(e) => {
                 emit_runtime_log(&app_handle, "error", format!("客户端监听失败: {}", e));
@@ -590,9 +590,16 @@ pub fn start_mouse_server(
         // 连接主循环：负责重连、握手、加密发送事件、接收 RELEASE。
         while *is_running_main.lock().unwrap() {
             println!("尝试连接到 {}:{}", ip, port);
-            let ip_addr: IpAddr = ip
-                .parse()
-                .unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+            let ip_addr: IpAddr = match ip.parse() {
+                Ok(addr) => addr,
+                Err(_) => {
+                    // 尝试解析为IPv6地址，如果失败则回退到IPv4本地地址
+                    match ip.parse::<std::net::Ipv6Addr>() {
+                        Ok(v6_addr) => IpAddr::V6(v6_addr),
+                        Err(_) => IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                    }
+                }
+            };
 
             match TcpStream::connect_timeout(&(ip_addr, port).into(), Duration::from_secs(2)) {
                 Ok(mut stream) => {
