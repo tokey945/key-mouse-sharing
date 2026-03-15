@@ -27,6 +27,9 @@ lazy_static::lazy_static! {
     static ref AUTH_RATE_LIMITER: Mutex<AuthRateLimiter> = Mutex::new(AuthRateLimiter::default());
 }
 
+// 鼠标移动速度系数，用于平衡不同系统间的鼠标加速差异
+const MOUSE_SPEED_FACTOR: f64 = 1.0;
+
 const AUTH_PREFIX: &str = "AUTH ";
 const AUTH_OK: &str = "AUTH_OK";
 const AUTH_FAIL: &str = "AUTH_FAIL";
@@ -380,10 +383,15 @@ pub fn start_mouse_client(app: AppHandle, port: u16, pair_code: String) -> Resul
                                 match serde_json::from_str::<AnyEvent>(&payload) {
                                     Ok(AnyEvent::MouseEvent(evt)) => match evt.kind {
                                         MouseEventKind::MoveDelta { dx, dy } => {
+                                            // 应用速度系数以平衡鼠标加速差异
+                                            let scaled_dx = (dx as f64 * MOUSE_SPEED_FACTOR) as i32;
+                                            let scaled_dy = (dy as f64 * MOUSE_SPEED_FACTOR) as i32;
+
                                             #[cfg(target_os = "windows")]
-                                            let (dx, dy) = (-dx, -dy);
-                                            cur_x = (cur_x + dx).clamp(0, max_x);
-                                            cur_y = (cur_y + dy).clamp(0, max_y);
+                                            let (scaled_dx, scaled_dy) = (-scaled_dx, -scaled_dy);
+
+                                            cur_x = (cur_x + scaled_dx).clamp(0, max_x);
+                                            cur_y = (cur_y + scaled_dy).clamp(0, max_y);
                                             move_cursor_to(cur_x, cur_y);
 
                                             // 到达左边缘时通知服务端释放
@@ -723,15 +731,25 @@ pub fn start_mouse_server(
                         if sharing {
                             let mut event_queue = event_queue.lock().unwrap();
 
-                            if let Some((dx, dy)) = pending_move.lock().unwrap().take() {
-                                event_queue.push_back(AnyEvent::MouseEvent(MouseEvent {
-                                    kind: MouseEventKind::MoveDelta { dx, dy },
-                                }));
+                            // 批量合并鼠标移动事件，减少网络往返次数
+                            let mut total_dx = 0;
+                            let mut total_dy = 0;
+                            while let Some((dx, dy)) = pending_move.lock().unwrap().take() {
+                                total_dx += dx;
+                                total_dy += dy;
                             }
 
-                            // 发送队列中的所有事件（FIFO + 明文帧）。
-                            while let Some(evt) = event_queue.pop_front() {
-                                let plain = serde_json::to_string(&evt).unwrap();
+                            // 只有当累积的移动超过阈值时才发送，减少小移动的延迟感
+                            if total_dx != 0 || total_dy != 0 {
+                                // 直接发送单个移动事件以保持平滑
+                                let plain =
+                                    serde_json::to_string(&AnyEvent::MouseEvent(MouseEvent {
+                                        kind: MouseEventKind::MoveDelta {
+                                            dx: total_dx,
+                                            dy: total_dy,
+                                        },
+                                    }))
+                                    .unwrap();
                                 let frame = encode_frame(&plain);
 
                                 if let Err(e) = stream.write_all(frame.as_bytes()) {
@@ -739,7 +757,22 @@ pub fn start_mouse_server(
                                     connection_broken = true;
                                     break;
                                 }
-                                let _ = stream.flush();
+                            }
+
+                            // 发送队列中的其他事件（按键、滚轮等）
+                            let mut batch_data = Vec::new();
+                            while let Some(evt) = event_queue.pop_front() {
+                                let plain = serde_json::to_string(&evt).unwrap();
+                                let frame = encode_frame(&plain);
+                                batch_data.extend(frame.into_bytes());
+                            }
+
+                            if !batch_data.is_empty() {
+                                if let Err(e) = stream.write_all(&batch_data) {
+                                    println!("发送键鼠鼠标数据错误: {}", e);
+                                    connection_broken = true;
+                                    break;
+                                }
                             }
                         }
 
@@ -747,7 +780,8 @@ pub fn start_mouse_server(
                             break;
                         }
 
-                        thread::sleep(Duration::from_millis(2));
+                        // 减少 sleep 时间以降低延迟
+                        thread::sleep(Duration::from_millis(1));
                     }
 
                     // 断开连接时恢复光标
