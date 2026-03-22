@@ -1,11 +1,12 @@
 use crate::logic::{
-    hide_cursor, move_cursor_to, show_cursor, simulate_button_down, simulate_button_up,
-    simulate_key_down, simulate_key_up, simulate_wheel, start_event_listener, AnyEvent, KeyEvent,
-    KeyEventKind, MouseEvent, MouseEventKind,
+    move_cursor_to, show_cursor, simulate_button_down, simulate_button_up, simulate_key_down,
+    simulate_key_up, simulate_wheel, start_event_listener, AnyEvent, KeyEvent, KeyEventKind,
+    MouseEvent, MouseEventKind,
 };
+use base64::Engine;
 use rdev::display_size;
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Shutdown, TcpListener, TcpStream};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
@@ -149,6 +150,48 @@ fn decode_frame(frame: &str) -> Result<String, String> {
         return Err("数据帧协议不匹配".to_string());
     };
     Ok(rest.to_string())
+}
+
+// 文件传输帧定义。
+const FILE_META_PREFIX: &str = "FILE_META ";
+const FILE_CHUNK_PREFIX: &str = "FILE_CHUNK ";
+const FILE_DONE: &str = "FILE_DONE";
+const FILE_ABORT: &str = "FILE_ABORT";
+
+fn encode_file_meta(file_name: &str, file_size: u64) -> String {
+    format!("{FILE_META_PREFIX}{}|{}\n", file_name, file_size)
+}
+
+fn encode_file_chunk(chunk_b64: &str) -> String {
+    format!("{FILE_CHUNK_PREFIX}{}\n", chunk_b64)
+}
+
+fn decode_file_meta(frame: &str) -> Result<(String, u64), String> {
+    let frame = frame.trim();
+    let Some(payload) = frame.strip_prefix(FILE_META_PREFIX) else {
+        return Err("文件元信息协议不匹配".to_string());
+    };
+    let mut parts = payload.splitn(2, '|');
+    let name = parts
+        .next()
+        .ok_or_else(|| "文件名缺失".to_string())?
+        .to_string();
+    let size = parts
+        .next()
+        .ok_or_else(|| "文件大小缺失".to_string())?
+        .parse::<u64>()
+        .map_err(|_| "文件大小解析失败".to_string())?;
+    Ok((name, size))
+}
+
+fn decode_file_chunk(frame: &str) -> Result<Vec<u8>, String> {
+    let frame = frame.trim();
+    let Some(payload) = frame.strip_prefix(FILE_CHUNK_PREFIX) else {
+        return Err("文件块协议不匹配".to_string());
+    };
+    base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|e| format!("文件块base64解析失败: {}", e))
 }
 
 // 接收端握手（简化版：无加密）。
@@ -457,6 +500,475 @@ pub fn start_mouse_client(app: AppHandle, port: u16, pair_code: String) -> Resul
             }
         }
     });
+    Ok(())
+}
+
+#[tauri::command]
+pub fn start_file_client(
+    app: AppHandle,
+    port: u16,
+    pair_code: String,
+    download_dir: String,
+) -> Result<(), String> {
+    let pair_code = pair_code.trim().to_string();
+    validate_pair_code_strength(&pair_code)?;
+
+    let download_path = std::path::PathBuf::from(download_dir.trim());
+    if !download_path.exists() || !download_path.is_dir() {
+        return Err("下载目录不存在或不是目录".to_string());
+    }
+
+    let mut running = IS_RUNNING.lock().unwrap();
+    *running = true;
+    drop(running);
+
+    emit_runtime_log(&app, "info", format!("文件客户端启动，监听端口 {}", port));
+
+    let is_running = Arc::clone(&IS_RUNNING);
+    let app_handle = app.clone();
+    thread::spawn(move || {
+        let listener = match TcpListener::bind(("0.0.0.0", port)) {
+            Ok(listener) => listener,
+            Err(e) => match TcpListener::bind(("::", port)) {
+                Ok(listener) => listener,
+                Err(e2) => {
+                    emit_runtime_log(
+                        &app_handle,
+                        "error",
+                        format!("文件客户端监听失败(IPv4: {}, IPv6: {})", e, e2),
+                    );
+                    return;
+                }
+            },
+        };
+
+        if let Err(e) = listener.set_nonblocking(true) {
+            println!("[文件客户端] 设置监听非阻塞失败: {}", e);
+        }
+
+        let local_addr = listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+        emit_runtime_log(
+            &app_handle,
+            "info",
+            format!("文件客户端已启动，监听 {}，等待连接...", local_addr),
+        );
+
+        while *is_running.lock().unwrap() {
+            match listener.accept() {
+                Ok((mut stream, addr)) => {
+                    let peer_ip = addr.ip();
+
+                    if let Err(e) = stream.set_nonblocking(false) {
+                        println!("[文件客户端] 设置阻塞模式失败: {}", e);
+                    }
+
+                    // 限流同鼠标共享
+                    if let Some(remaining) = auth_block_remaining(peer_ip) {
+                        emit_runtime_log(
+                            &app_handle,
+                            "warn",
+                            format!(
+                                "拒绝 {} 的连接：鉴权失败过多，剩余锁定 {} 秒",
+                                peer_ip,
+                                remaining.as_secs()
+                            ),
+                        );
+                        let _ = stream.shutdown(Shutdown::Both);
+                        continue;
+                    }
+
+                    emit_runtime_log(&app_handle, "info", format!("文件客户端收到连接: {}", addr));
+
+                    let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
+                    let _ = stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
+
+                    if let Err(e) = authenticate_client_connection(&mut stream, &pair_code) {
+                        auth_record_failure(peer_ip);
+                        emit_runtime_log(
+                            &app_handle,
+                            "warn",
+                            format!("文件客户端鉴权失败({}): {}", peer_ip, e),
+                        );
+                        let _ = stream.shutdown(Shutdown::Both);
+                        continue;
+                    }
+
+                    auth_record_success(peer_ip);
+                    emit_runtime_log(
+                        &app_handle,
+                        "success",
+                        format!("文件客户端鉴权通过: {}", addr),
+                    );
+
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+
+                    let reader_stream = match stream.try_clone() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            emit_runtime_log(
+                                &app_handle,
+                                "error",
+                                format!("文件客户端复制连接失败: {}", e),
+                            );
+                            let _ = stream.shutdown(Shutdown::Both);
+                            continue;
+                        }
+                    };
+                    let mut reader = BufReader::new(reader_stream);
+
+                    let mut current_file: Option<std::fs::File> = None;
+                    let mut expected_size: Option<u64> = None;
+                    let mut received: u64 = 0;
+                    let mut current_name = String::new();
+
+                    loop {
+                        if !*is_running.lock().unwrap() {
+                            break;
+                        }
+
+                        let mut line = String::new();
+                        match reader.read_line(&mut line) {
+                            Ok(0) => break,
+                            Ok(_) => {
+                                let trimmed = line.trim();
+
+                                if trimmed == FILE_ABORT {
+                                    emit_runtime_log(&app_handle, "warn", "文件传输被发送端中断");
+                                    if let Some(mut file) = current_file.take() {
+                                        let _ = file.flush();
+                                    }
+                                    continue;
+                                }
+
+                                if trimmed == FILE_DONE {
+                                    if let Some(mut file) = current_file.take() {
+                                        let _ = file.flush();
+                                    }
+                                    emit_runtime_log(
+                                        &app_handle,
+                                        "success",
+                                        format!("文件完成: {} ({} bytes)", current_name, received),
+                                    );
+                                    current_name.clear();
+                                    expected_size = None;
+                                    received = 0;
+                                    continue;
+                                }
+
+                                if trimmed.starts_with(FILE_META_PREFIX) {
+                                    match decode_file_meta(trimmed) {
+                                        Ok((name, size)) => {
+                                            let file_name = std::path::Path::new(&name)
+                                                .file_name()
+                                                .and_then(|n| n.to_str())
+                                                .ok_or_else(|| "文件名不合法".to_string());
+                                            match file_name {
+                                                Ok(file_name) => {
+                                                    let path = download_path.join(file_name);
+                                                    match std::fs::File::create(&path) {
+                                                        Ok(file) => {
+                                                            current_file = Some(file);
+                                                            expected_size = Some(size);
+                                                            received = 0;
+                                                            current_name = file_name.to_string();
+                                                            emit_runtime_log(
+                                                                &app_handle,
+                                                                "info",
+                                                                format!(
+                                                                    "开始接收文件: {} ({} bytes)",
+                                                                    file_name, size
+                                                                ),
+                                                            );
+                                                        }
+                                                        Err(e) => {
+                                                            emit_runtime_log(
+                                                                &app_handle,
+                                                                "error",
+                                                                format!(
+                                                                    "无法创建文件 {}: {}",
+                                                                    file_name, e
+                                                                ),
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    emit_runtime_log(&app_handle, "error", e);
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            emit_runtime_log(
+                                                &app_handle,
+                                                "error",
+                                                format!("解析文件元信息失败: {}", e),
+                                            );
+                                        }
+                                    }
+                                    continue;
+                                }
+
+                                if trimmed.starts_with(FILE_CHUNK_PREFIX) {
+                                    match decode_file_chunk(trimmed) {
+                                        Ok(bytes) => {
+                                            if let Some(file) = current_file.as_mut() {
+                                                if let Err(e) = file.write_all(&bytes) {
+                                                    emit_runtime_log(
+                                                        &app_handle,
+                                                        "error",
+                                                        format!("写文件失败: {}", e),
+                                                    );
+                                                    break;
+                                                }
+                                                received += bytes.len() as u64;
+                                                if let Some(total) = expected_size {
+                                                    let pct =
+                                                        (received as f64 / total as f64) * 100.0;
+                                                    emit_runtime_log(
+                                                        &app_handle,
+                                                        "info",
+                                                        format!(
+                                                            "{} 传输中: {:.1}% ({}/{})",
+                                                            current_name, pct, received, total
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            emit_runtime_log(
+                                                &app_handle,
+                                                "error",
+                                                format!("解析文件块失败: {}", e),
+                                            );
+                                            break;
+                                        }
+                                    }
+                                    continue;
+                                }
+
+                                // 未知协议：兼容保留
+                            }
+                            Err(e) if is_socket_timeout(&e) => continue,
+                            Err(e) => {
+                                emit_runtime_log(
+                                    &app_handle,
+                                    "error",
+                                    format!("文件客户端读取失败: {}", e),
+                                );
+                                break;
+                            }
+                        }
+                    }
+
+                    if let Some(mut file) = current_file {
+                        let _ = file.flush();
+                    }
+                    let _ = stream.shutdown(Shutdown::Both);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => {
+                    emit_runtime_log(
+                        &app_handle,
+                        "warn",
+                        format!("文件客户端接收连接错误: {}", e),
+                    );
+                    thread::sleep(Duration::from_millis(200));
+                }
+            }
+        }
+
+        emit_runtime_log(&app_handle, "info", "文件客户端已停止");
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn start_file_server(
+    app: AppHandle,
+    ip: String,
+    port: u16,
+    pair_code: String,
+    file_paths: Vec<String>,
+) -> Result<(), String> {
+    let pair_code = pair_code.trim().to_string();
+    validate_pair_code_strength(&pair_code)?;
+
+    if file_paths.is_empty() {
+        return Err("请选择至少一个文件".to_string());
+    }
+
+    let mut running = IS_RUNNING.lock().unwrap();
+    *running = true;
+    drop(running);
+
+    emit_runtime_log(
+        &app,
+        "info",
+        format!("文件服务端启动，目标 {}:{}", ip, port),
+    );
+
+    let is_running = Arc::clone(&IS_RUNNING);
+    let app_handle = app.clone();
+    thread::spawn(move || {
+        while *is_running.lock().unwrap() {
+            let ip_addr: IpAddr = match ip.parse() {
+                Ok(addr) => addr,
+                Err(e) => {
+                    emit_runtime_log(
+                        &app_handle,
+                        "warn",
+                        format!("文件服务端 IP 解析失败: {}", e),
+                    );
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+            };
+
+            match TcpStream::connect_timeout(&(ip_addr, port).into(), Duration::from_secs(5)) {
+                Ok(mut stream) => {
+                    let _ = stream.set_nodelay(true);
+                    let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
+                    let _ = stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
+
+                    match authenticate_server_connection(&mut stream, &pair_code) {
+                        Ok(_) => {
+                            emit_runtime_log(&app_handle, "success", "文件服务端鉴权通过");
+                        }
+                        Err(e) => {
+                            emit_runtime_log(
+                                &app_handle,
+                                "warn",
+                                format!("文件服务端鉴权失败: {}", e),
+                            );
+                            let _ = stream.shutdown(Shutdown::Both);
+                            thread::sleep(Duration::from_secs(2));
+                            continue;
+                        }
+                    }
+
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+
+                    for path in file_paths.iter() {
+                        if !*is_running.lock().unwrap() {
+                            break;
+                        }
+
+                        let path = std::path::Path::new(path);
+                        if !path.exists() || !path.is_file() {
+                            emit_runtime_log(
+                                &app_handle,
+                                "warn",
+                                format!("跳过无效文件: {}", path.display()),
+                            );
+                            continue;
+                        }
+
+                        let file_name = match path.file_name().and_then(|n| n.to_str()) {
+                            Some(n) => n,
+                            None => {
+                                emit_runtime_log(
+                                    &app_handle,
+                                    "warn",
+                                    format!("文件名无法解码: {}", path.display()),
+                                );
+                                continue;
+                            }
+                        };
+
+                        let size = match path.metadata() {
+                            Ok(meta) => meta.len(),
+                            Err(e) => {
+                                emit_runtime_log(
+                                    &app_handle,
+                                    "warn",
+                                    format!("无法读取文件元数据: {}", e),
+                                );
+                                continue;
+                            }
+                        };
+
+                        let _ = stream.write_all(encode_file_meta(file_name, size).as_bytes());
+                        let _ = stream.flush();
+                        emit_runtime_log(
+                            &app_handle,
+                            "info",
+                            format!("开始发送文件: {} ({} bytes)", file_name, size),
+                        );
+
+                        match std::fs::File::open(path) {
+                            Ok(mut file) => {
+                                let mut buffer = [0_u8; 64 * 1024];
+                                loop {
+                                    if !*is_running.lock().unwrap() {
+                                        let _ = stream
+                                            .write_all(format!("{}\n", FILE_ABORT).as_bytes());
+                                        break;
+                                    }
+
+                                    let read_bytes = match file.read(&mut buffer) {
+                                        Ok(0) => break,
+                                        Ok(n) => n,
+                                        Err(e) => {
+                                            emit_runtime_log(
+                                                &app_handle,
+                                                "error",
+                                                format!("读取文件失败: {}", e),
+                                            );
+                                            let _ = stream
+                                                .write_all(format!("{}\n", FILE_ABORT).as_bytes());
+                                            break;
+                                        }
+                                    };
+
+                                    let b64 = base64::engine::general_purpose::STANDARD
+                                        .encode(&buffer[..read_bytes]);
+                                    let _ = stream.write_all(encode_file_chunk(&b64).as_bytes());
+                                }
+
+                                let _ = stream.write_all(format!("{}\n", FILE_DONE).as_bytes());
+                                let _ = stream.flush();
+                                emit_runtime_log(
+                                    &app_handle,
+                                    "success",
+                                    format!("文件发送完成: {}", file_name),
+                                );
+                            }
+                            Err(e) => {
+                                emit_runtime_log(
+                                    &app_handle,
+                                    "error",
+                                    format!("无法打开文件 {}: {}", path.display(), e),
+                                );
+                                let _ = stream.write_all(format!("{}\n", FILE_ABORT).as_bytes());
+                            }
+                        }
+                    }
+
+                    let _ = stream.shutdown(Shutdown::Both);
+                    break;
+                }
+                Err(e) => {
+                    emit_runtime_log(&app_handle, "warn", format!("文件服务端连接失败: {}", e));
+                    if !*is_running.lock().unwrap() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_secs(2));
+                }
+            }
+        }
+
+        emit_runtime_log(&app_handle, "info", "文件服务端退出");
+    });
+
     Ok(())
 }
 
