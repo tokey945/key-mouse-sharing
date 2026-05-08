@@ -16,18 +16,18 @@ where
 }
 
 // 传输层统一事件模型：控制端采集后序列化发送，接收端反序列化执行。
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum AnyEvent {
     MouseEvent(MouseEvent),
     KeyEvent(KeyEvent),
 }
 
 // 鼠标事件定义（Move 使用绝对坐标，MoveDelta 使用相对位移）。
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MouseEvent {
     pub kind: MouseEventKind,
 }
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum MouseEventKind {
     MoveDelta { dx: i32, dy: i32 },
     Move { x: i32, y: i32 },
@@ -37,11 +37,11 @@ pub enum MouseEventKind {
 }
 
 // 键盘事件定义（按下/抬起分离，避免按键状态错乱）。
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct KeyEvent {
     pub kind: KeyEventKind,
 }
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum KeyEventKind {
     KeyDown { key: String },
     KeyUp { key: String },

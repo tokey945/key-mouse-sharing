@@ -1,16 +1,77 @@
-# Tauri + Vue + TypeScript
+# key-mouse-sharing
 
-This template should help get you started developing with Vue 3 and TypeScript in Vite. The template uses Vue 3 `<script setup>` SFCs, check out the [script setup docs](https://v3.vuejs.org/api/sfc-script-setup.html#sfc-script-setup) to learn more.
+基于 Tauri 2、Vue 3 和 Rust 的局域网键鼠与文件共享工具。当前版本重点稳定 macOS 上的键鼠共享和文件传输；屏幕共享入口保留，但暂未开放。
 
-## Recommended IDE Setup
+## 功能状态
 
-- [VS Code](https://code.visualstudio.com/) + [Volar](https://marketplace.visualstudio.com/items?itemName=Vue.volar) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+- 键鼠共享：控制端主动连接接收端，鼠标触达右侧屏幕边缘后开始转发键鼠事件，远端回到左侧边缘释放。
+- 文件共享：发送端主动连接接收端，支持多文件、重复文件名避让、传输完成大小与校验值验证。
+- 屏幕共享：本轮未实现，页面仅展示明确的未开放状态。
 
-## Type Support For `.vue` Imports in TS
+## 运行
 
-Since TypeScript cannot handle type information for `.vue` imports, they are shimmed to be a generic Vue component type by default. In most cases this is fine if you don't really care about component prop types outside of templates. However, if you wish to get actual prop types in `.vue` imports (for example to get props validation when using manual `h(...)` calls), you can enable Volar's Take Over mode by following these steps:
+```bash
+npm ci
+npm run tauri dev
+```
 
-1. Run `Extensions: Show Built-in Extensions` from VS Code's command palette, look for `TypeScript and JavaScript Language Features`, then right click and select `Disable (Workspace)`. By default, Take Over mode will enable itself if the default TypeScript extension is disabled.
-2. Reload the VS Code window by running `Developer: Reload Window` from the command palette.
+前端浏览器预览：
 
-You can learn more about Take Over mode [here](https://github.com/johnsoncodehk/volar/discussions/471).
+```bash
+npm run dev
+```
+
+生产构建：
+
+```bash
+npm run build
+npm run tauri build
+```
+
+## macOS 权限
+
+键鼠共享需要系统权限，否则无法捕获或模拟输入：
+
+- 系统设置 -> 隐私与安全性 -> 辅助功能：允许本应用或开发中的终端。
+- 系统设置 -> 隐私与安全性 -> 输入监控：允许本应用或开发中的终端。
+
+如果 `cargo check` 或 `git` 报 Xcode license 错误，需要先在本机终端处理 Xcode license。项目不会自动执行 `sudo` 或修改系统授权。
+
+## 使用方式
+
+1. 两台设备连接到同一局域网。
+2. 接收端选择“客户端/接收端”，设置端口和配对码，启动监听。
+3. 控制端或发送端填写目标 IP、同一端口和配对码，然后启动。
+4. 键鼠共享时，控制端鼠标移动到右侧边缘进入共享；远端鼠标到左侧边缘释放。
+
+配对码至少 8 位，必须包含字母和数字。默认示例为 `Share2026`，正式使用时建议改成自己的配对码。
+
+## 测试
+
+```bash
+npm run typecheck
+npm run build
+npm run audit
+cargo test --manifest-path src-tauri/Cargo.toml
+cargo check --manifest-path src-tauri/Cargo.toml
+```
+
+文件传输建议覆盖：
+
+- 空文件、小文件、大文件、多文件。
+- 错误配对码。
+- 接收目录无效。
+- 传输中停止。
+- 目标目录已有同名文件。
+
+键鼠共享建议覆盖：
+
+- 重复启动与停止。
+- 触边进入共享和远端释放。
+- A 键、修饰键、方向键、鼠标拖拽、滚轮。
+
+## 已知限制
+
+- 网络协议仍是局域网明文传输，只适合可信网络。
+- 当前不是高性能远控方案，没有屏幕编码/低延迟视频链路。
+- Windows 平台保持兼容性维护，当前主要验收平台是 macOS。

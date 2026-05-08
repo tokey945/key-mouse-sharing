@@ -1,7 +1,8 @@
 use crate::logic::{AnyEvent, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind};
+use once_cell::sync::Lazy;
 use std::ptr;
 use std::sync::mpsc::Sender;
-use std::sync::Mutex;
+use std::sync::{Mutex, Once};
 use winapi::shared::minwindef::{LPARAM, WPARAM};
 use winapi::um::winuser::{
     CallNextHookEx, SetWindowsHookExW, ShowCursor, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
@@ -32,6 +33,13 @@ pub fn show_cursor() {
 #[allow(static_mut_refs)]
 static mut HOOK_HANDLE: Option<(*mut std::ffi::c_void, *mut std::ffi::c_void)> = None;
 static HOOK_MUTEX: Mutex<()> = Mutex::new(());
+static EVENT_LISTENER_INIT: Once = Once::new();
+static EVENT_SUBSCRIBERS: Lazy<Mutex<Vec<Sender<AnyEvent>>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+fn publish_event(event: AnyEvent) {
+    let mut subscribers = EVENT_SUBSCRIBERS.lock().unwrap();
+    subscribers.retain(|tx| tx.send(event.clone()).is_ok());
+}
 
 /// 屏蔽本地键盘和鼠标按键输入（不影响鼠标移动）
 #[cfg(target_os = "windows")]
@@ -242,53 +250,57 @@ pub fn start_drag_listener(tx: Sender<(f64, f64)>) {
 }
 
 pub fn start_event_listener(tx: Sender<AnyEvent>) {
-    std::thread::spawn(move || {
-        use rdev::{listen, Event, EventType};
-        let callback = move |event: Event| match event.event_type {
-            EventType::MouseMove { x, y } => {
-                let _ = tx.send(AnyEvent::MouseEvent(MouseEvent {
-                    kind: MouseEventKind::Move {
-                        x: x as i32,
-                        y: y as i32,
-                    },
-                }));
-            }
-            EventType::ButtonPress(btn) => {
-                let _ = tx.send(AnyEvent::MouseEvent(MouseEvent {
-                    kind: MouseEventKind::ButtonDown {
-                        button: format!("{:?}", btn),
-                    },
-                }));
-            }
-            EventType::ButtonRelease(btn) => {
-                let _ = tx.send(AnyEvent::MouseEvent(MouseEvent {
-                    kind: MouseEventKind::ButtonUp {
-                        button: format!("{:?}", btn),
-                    },
-                }));
-            }
-            EventType::Wheel { delta_y, .. } => {
-                let _ = tx.send(AnyEvent::MouseEvent(MouseEvent {
-                    kind: MouseEventKind::Wheel {
-                        delta: delta_y as i32,
-                    },
-                }));
-            }
-            EventType::KeyPress(key) => {
-                let _ = tx.send(AnyEvent::KeyEvent(KeyEvent {
-                    kind: KeyEventKind::KeyDown {
-                        key: format!("{:?}", key),
-                    },
-                }));
-            }
-            EventType::KeyRelease(key) => {
-                let _ = tx.send(AnyEvent::KeyEvent(KeyEvent {
-                    kind: KeyEventKind::KeyUp {
-                        key: format!("{:?}", key),
-                    },
-                }));
-            }
-        };
-        listen(callback).unwrap();
+    EVENT_SUBSCRIBERS.lock().unwrap().push(tx);
+
+    EVENT_LISTENER_INIT.call_once(|| {
+        std::thread::spawn(move || {
+            use rdev::{listen, Event, EventType};
+            let callback = move |event: Event| match event.event_type {
+                EventType::MouseMove { x, y } => {
+                    publish_event(AnyEvent::MouseEvent(MouseEvent {
+                        kind: MouseEventKind::Move {
+                            x: x as i32,
+                            y: y as i32,
+                        },
+                    }));
+                }
+                EventType::ButtonPress(btn) => {
+                    publish_event(AnyEvent::MouseEvent(MouseEvent {
+                        kind: MouseEventKind::ButtonDown {
+                            button: format!("{:?}", btn),
+                        },
+                    }));
+                }
+                EventType::ButtonRelease(btn) => {
+                    publish_event(AnyEvent::MouseEvent(MouseEvent {
+                        kind: MouseEventKind::ButtonUp {
+                            button: format!("{:?}", btn),
+                        },
+                    }));
+                }
+                EventType::Wheel { delta_y, .. } => {
+                    publish_event(AnyEvent::MouseEvent(MouseEvent {
+                        kind: MouseEventKind::Wheel {
+                            delta: delta_y as i32,
+                        },
+                    }));
+                }
+                EventType::KeyPress(key) => {
+                    publish_event(AnyEvent::KeyEvent(KeyEvent {
+                        kind: KeyEventKind::KeyDown {
+                            key: format!("{:?}", key),
+                        },
+                    }));
+                }
+                EventType::KeyRelease(key) => {
+                    publish_event(AnyEvent::KeyEvent(KeyEvent {
+                        kind: KeyEventKind::KeyUp {
+                            key: format!("{:?}", key),
+                        },
+                    }));
+                }
+            };
+            listen(callback).unwrap();
+        });
     });
 }

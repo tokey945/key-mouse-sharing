@@ -1,7 +1,7 @@
 use crate::logic::{
-    move_cursor_to, show_cursor, simulate_button_down, simulate_button_up, simulate_key_down,
-    simulate_key_up, simulate_wheel, start_event_listener, AnyEvent, KeyEvent, KeyEventKind,
-    MouseEvent, MouseEventKind,
+    hide_cursor, move_cursor_to, show_cursor, simulate_button_down, simulate_button_up,
+    simulate_key_down, simulate_key_up, simulate_wheel, start_event_listener, AnyEvent,
+    KeyEventKind, MouseEvent, MouseEventKind,
 };
 use base64::Engine;
 use rdev::display_size;
@@ -31,7 +31,6 @@ lazy_static::lazy_static! {
 // 鼠标移动速度系数，用于平衡不同系统间的鼠标加速差异
 const MOUSE_SPEED_FACTOR: f64 = 1.0;
 
-const AUTH_PREFIX: &str = "AUTH ";
 const AUTH_OK: &str = "AUTH_OK";
 const AUTH_FAIL: &str = "AUTH_FAIL";
 const DATA_PREFIX: &str = "DATA ";
@@ -74,6 +73,29 @@ fn emit_runtime_log(app: &AppHandle, level: &str, message: impl Into<String>) {
         ts_ms,
     };
     let _ = app.emit("kms-log", event);
+}
+
+fn begin_session() -> Result<(), String> {
+    let mut running = IS_RUNNING.lock().unwrap();
+    if *running {
+        return Err("已有共享任务正在运行，请先停止当前任务".to_string());
+    }
+    *running = true;
+    drop(running);
+
+    let mut connected = IS_CONNECTED.lock().unwrap();
+    *connected = false;
+    Ok(())
+}
+
+fn finish_session() {
+    let mut running = IS_RUNNING.lock().unwrap();
+    *running = false;
+    drop(running);
+
+    let mut connected = IS_CONNECTED.lock().unwrap();
+    *connected = false;
+    show_cursor();
 }
 
 // 配对码强度策略：至少 8 位，且必须包含字母+数字。
@@ -156,6 +178,7 @@ fn decode_frame(frame: &str) -> Result<String, String> {
 const FILE_META_PREFIX: &str = "FILE_META ";
 const FILE_CHUNK_PREFIX: &str = "FILE_CHUNK ";
 const FILE_DONE: &str = "FILE_DONE";
+const FILE_DONE_PREFIX: &str = "FILE_DONE ";
 const FILE_ABORT: &str = "FILE_ABORT";
 
 fn encode_file_meta(file_name: &str, file_size: u64) -> String {
@@ -164,6 +187,20 @@ fn encode_file_meta(file_name: &str, file_size: u64) -> String {
 
 fn encode_file_chunk(chunk_b64: &str) -> String {
     format!("{FILE_CHUNK_PREFIX}{}\n", chunk_b64)
+}
+
+fn encode_file_done(file_name: &str, file_size: u64, checksum: u64) -> String {
+    format!(
+        "{FILE_DONE_PREFIX}{}|{}|{}\n",
+        file_name, file_size, checksum
+    )
+}
+
+fn checksum_update(mut checksum: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        checksum = checksum.wrapping_mul(16_777_619) ^ u64::from(*byte);
+    }
+    checksum
 }
 
 fn decode_file_meta(frame: &str) -> Result<(String, u64), String> {
@@ -184,6 +221,29 @@ fn decode_file_meta(frame: &str) -> Result<(String, u64), String> {
     Ok((name, size))
 }
 
+fn decode_file_done(frame: &str) -> Result<(String, u64, u64), String> {
+    let frame = frame.trim();
+    let Some(payload) = frame.strip_prefix(FILE_DONE_PREFIX) else {
+        return Err("文件完成帧协议不匹配".to_string());
+    };
+    let mut parts = payload.splitn(3, '|');
+    let name = parts
+        .next()
+        .ok_or_else(|| "文件名缺失".to_string())?
+        .to_string();
+    let size = parts
+        .next()
+        .ok_or_else(|| "文件大小缺失".to_string())?
+        .parse::<u64>()
+        .map_err(|_| "文件大小解析失败".to_string())?;
+    let checksum = parts
+        .next()
+        .ok_or_else(|| "文件校验值缺失".to_string())?
+        .parse::<u64>()
+        .map_err(|_| "文件校验值解析失败".to_string())?;
+    Ok((name, size, checksum))
+}
+
 fn decode_file_chunk(frame: &str) -> Result<Vec<u8>, String> {
     let frame = frame.trim();
     let Some(payload) = frame.strip_prefix(FILE_CHUNK_PREFIX) else {
@@ -192,6 +252,29 @@ fn decode_file_chunk(frame: &str) -> Result<Vec<u8>, String> {
     base64::engine::general_purpose::STANDARD
         .decode(payload)
         .map_err(|e| format!("文件块base64解析失败: {}", e))
+}
+
+fn unique_download_path(dir: &std::path::Path, file_name: &str) -> std::path::PathBuf {
+    let original = std::path::Path::new(file_name);
+    let stem = original
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("download");
+    let ext = original.extension().and_then(|e| e.to_str());
+    let mut path = dir.join(file_name);
+    let mut index = 1;
+
+    while path.exists() {
+        let candidate = match ext {
+            Some(ext) if !ext.is_empty() => format!("{stem} ({index}).{ext}"),
+            _ => format!("{stem} ({index})"),
+        };
+        path = dir.join(candidate);
+        index += 1;
+    }
+
+    path
 }
 
 // 接收端握手（简化版：无加密）。
@@ -265,14 +348,8 @@ fn authenticate_server_connection(stream: &mut TcpStream, pair_code: &str) -> Re
 
 #[tauri::command]
 pub fn stop_sharing(app: AppHandle) {
-    // 通过共享开关通知所有工作线程尽快退出。
-    let mut running = IS_RUNNING.lock().unwrap();
-    *running = false;
-    drop(running);
-
-    let mut connected = IS_CONNECTED.lock().unwrap();
-    *connected = false;
-
+    // 通过共享开关通知所有工作线程尽快退出，并立即恢复本机可见状态。
+    finish_session();
     emit_runtime_log(&app, "info", "共享已停止");
     println!("停止共享");
 }
@@ -282,10 +359,7 @@ pub fn start_mouse_client(app: AppHandle, port: u16, pair_code: String) -> Resul
     // 先在命令入口做参数合法性校验，避免启动后才失败。
     let pair_code = pair_code.trim().to_string();
     validate_pair_code_strength(&pair_code)?;
-
-    let mut running = IS_RUNNING.lock().unwrap();
-    *running = true;
-    drop(running);
+    begin_session()?;
 
     emit_runtime_log(&app, "info", format!("客户端启动，监听端口 {}", port));
 
@@ -307,6 +381,7 @@ pub fn start_mouse_client(app: AppHandle, port: u16, pair_code: String) -> Resul
                             format!("客户端监听失败(IPv4: {}, IPv6: {})", e, e2),
                         );
                         println!("[客户端] 监听端口失败: IPv4={}, IPv6={}", e, e2);
+                        finish_session();
                         return;
                     }
                 }
@@ -499,6 +574,9 @@ pub fn start_mouse_client(app: AppHandle, port: u16, pair_code: String) -> Resul
                 }
             }
         }
+
+        finish_session();
+        emit_runtime_log(&app_handle, "info", "客户端已停止");
     });
     Ok(())
 }
@@ -517,10 +595,7 @@ pub fn start_file_client(
     if !download_path.exists() || !download_path.is_dir() {
         return Err("下载目录不存在或不是目录".to_string());
     }
-
-    let mut running = IS_RUNNING.lock().unwrap();
-    *running = true;
-    drop(running);
+    begin_session()?;
 
     emit_runtime_log(&app, "info", format!("文件客户端启动，监听端口 {}", port));
 
@@ -537,6 +612,7 @@ pub fn start_file_client(
                         "error",
                         format!("文件客户端监听失败(IPv4: {}, IPv6: {})", e, e2),
                     );
+                    finish_session();
                     return;
                 }
             },
@@ -621,8 +697,10 @@ pub fn start_file_client(
                     let mut reader = BufReader::new(reader_stream);
 
                     let mut current_file: Option<std::fs::File> = None;
+                    let mut current_path: Option<std::path::PathBuf> = None;
                     let mut expected_size: Option<u64> = None;
                     let mut received: u64 = 0;
+                    let mut checksum: u64 = 0;
                     let mut current_name = String::new();
 
                     loop {
@@ -641,21 +719,78 @@ pub fn start_file_client(
                                     if let Some(mut file) = current_file.take() {
                                         let _ = file.flush();
                                     }
-                                    continue;
-                                }
-
-                                if trimmed == FILE_DONE {
-                                    if let Some(mut file) = current_file.take() {
-                                        let _ = file.flush();
+                                    if let Some(path) = current_path.take() {
+                                        let _ = std::fs::remove_file(path);
                                     }
-                                    emit_runtime_log(
-                                        &app_handle,
-                                        "success",
-                                        format!("文件完成: {} ({} bytes)", current_name, received),
-                                    );
                                     current_name.clear();
                                     expected_size = None;
                                     received = 0;
+                                    checksum = 0;
+                                    continue;
+                                }
+
+                                if trimmed == FILE_DONE || trimmed.starts_with(FILE_DONE_PREFIX) {
+                                    if let Some(mut file) = current_file.take() {
+                                        let _ = file.flush();
+                                    }
+                                    let done_result = if trimmed == FILE_DONE {
+                                        expected_size
+                                            .map(|size| (current_name.clone(), size, checksum))
+                                            .ok_or_else(|| {
+                                                "缺少文件大小，无法校验完成帧".to_string()
+                                            })
+                                    } else {
+                                        decode_file_done(trimmed)
+                                    };
+
+                                    match done_result {
+                                        Ok((_name, done_size, done_checksum))
+                                            if Some(done_size) == expected_size
+                                                && received == done_size
+                                                && checksum == done_checksum =>
+                                        {
+                                            emit_runtime_log(
+                                                &app_handle,
+                                                "success",
+                                                format!(
+                                                    "文件完成: {} ({} bytes)",
+                                                    current_name, received
+                                                ),
+                                            );
+                                        }
+                                        Ok((_name, done_size, done_checksum)) => {
+                                            emit_runtime_log(
+                                                &app_handle,
+                                                "error",
+                                                format!(
+                                                    "文件校验失败: {}，收到 {}/{} bytes，checksum {}/{}",
+                                                    current_name,
+                                                    received,
+                                                    done_size,
+                                                    checksum,
+                                                    done_checksum
+                                                ),
+                                            );
+                                            if let Some(path) = current_path.take() {
+                                                let _ = std::fs::remove_file(path);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            emit_runtime_log(
+                                                &app_handle,
+                                                "error",
+                                                format!("文件完成帧无效: {}", e),
+                                            );
+                                            if let Some(path) = current_path.take() {
+                                                let _ = std::fs::remove_file(path);
+                                            }
+                                        }
+                                    }
+                                    current_name.clear();
+                                    current_path = None;
+                                    expected_size = None;
+                                    received = 0;
+                                    checksum = 0;
                                     continue;
                                 }
 
@@ -668,19 +803,35 @@ pub fn start_file_client(
                                                 .ok_or_else(|| "文件名不合法".to_string());
                                             match file_name {
                                                 Ok(file_name) => {
-                                                    let path = download_path.join(file_name);
+                                                    if let Some(mut file) = current_file.take() {
+                                                        let _ = file.flush();
+                                                    }
+                                                    if let Some(path) = current_path.take() {
+                                                        let _ = std::fs::remove_file(path);
+                                                    }
+
+                                                    let path = unique_download_path(
+                                                        &download_path,
+                                                        file_name,
+                                                    );
                                                     match std::fs::File::create(&path) {
                                                         Ok(file) => {
                                                             current_file = Some(file);
+                                                            current_path = Some(path.clone());
                                                             expected_size = Some(size);
                                                             received = 0;
-                                                            current_name = file_name.to_string();
+                                                            checksum = 0;
+                                                            current_name = path
+                                                                .file_name()
+                                                                .and_then(|n| n.to_str())
+                                                                .unwrap_or(file_name)
+                                                                .to_string();
                                                             emit_runtime_log(
                                                                 &app_handle,
                                                                 "info",
                                                                 format!(
                                                                     "开始接收文件: {} ({} bytes)",
-                                                                    file_name, size
+                                                                    current_name, size
                                                                 ),
                                                             );
                                                         }
@@ -725,6 +876,7 @@ pub fn start_file_client(
                                                     break;
                                                 }
                                                 received += bytes.len() as u64;
+                                                checksum = checksum_update(checksum, &bytes);
                                                 if let Some(total) = expected_size {
                                                     let pct =
                                                         (received as f64 / total as f64) * 100.0;
@@ -785,6 +937,7 @@ pub fn start_file_client(
         }
 
         emit_runtime_log(&app_handle, "info", "文件客户端已停止");
+        finish_session();
     });
 
     Ok(())
@@ -800,14 +953,14 @@ pub fn start_file_server(
 ) -> Result<(), String> {
     let pair_code = pair_code.trim().to_string();
     validate_pair_code_strength(&pair_code)?;
+    let ip = ip.trim().to_string();
+    ip.parse::<IpAddr>()
+        .map_err(|e| format!("IP 地址解析失败: {}", e))?;
 
     if file_paths.is_empty() {
         return Err("请选择至少一个文件".to_string());
     }
-
-    let mut running = IS_RUNNING.lock().unwrap();
-    *running = true;
-    drop(running);
+    begin_session()?;
 
     emit_runtime_log(
         &app,
@@ -907,10 +1060,13 @@ pub fn start_file_server(
                         match std::fs::File::open(path) {
                             Ok(mut file) => {
                                 let mut buffer = [0_u8; 64 * 1024];
+                                let mut file_checksum = 0_u64;
+                                let mut completed = true;
                                 loop {
                                     if !*is_running.lock().unwrap() {
                                         let _ = stream
                                             .write_all(format!("{}\n", FILE_ABORT).as_bytes());
+                                        completed = false;
                                         break;
                                     }
 
@@ -925,22 +1081,39 @@ pub fn start_file_server(
                                             );
                                             let _ = stream
                                                 .write_all(format!("{}\n", FILE_ABORT).as_bytes());
+                                            completed = false;
                                             break;
                                         }
                                     };
 
+                                    file_checksum =
+                                        checksum_update(file_checksum, &buffer[..read_bytes]);
                                     let b64 = base64::engine::general_purpose::STANDARD
                                         .encode(&buffer[..read_bytes]);
-                                    let _ = stream.write_all(encode_file_chunk(&b64).as_bytes());
+                                    if let Err(e) =
+                                        stream.write_all(encode_file_chunk(&b64).as_bytes())
+                                    {
+                                        emit_runtime_log(
+                                            &app_handle,
+                                            "error",
+                                            format!("写入网络失败: {}", e),
+                                        );
+                                        completed = false;
+                                        break;
+                                    }
                                 }
 
-                                let _ = stream.write_all(format!("{}\n", FILE_DONE).as_bytes());
-                                let _ = stream.flush();
-                                emit_runtime_log(
-                                    &app_handle,
-                                    "success",
-                                    format!("文件发送完成: {}", file_name),
-                                );
+                                if completed {
+                                    let _ = stream.write_all(
+                                        encode_file_done(file_name, size, file_checksum).as_bytes(),
+                                    );
+                                    let _ = stream.flush();
+                                    emit_runtime_log(
+                                        &app_handle,
+                                        "success",
+                                        format!("文件发送完成: {}", file_name),
+                                    );
+                                }
                             }
                             Err(e) => {
                                 emit_runtime_log(
@@ -967,6 +1140,7 @@ pub fn start_file_server(
         }
 
         emit_runtime_log(&app_handle, "info", "文件服务端退出");
+        finish_session();
     });
 
     Ok(())
@@ -982,10 +1156,10 @@ pub fn start_mouse_server(
     // 控制端角色：主动连接接收端并转发本机键鼠事件。
     let pair_code = pair_code.trim().to_string();
     validate_pair_code_strength(&pair_code)?;
-
-    let mut running = IS_RUNNING.lock().unwrap();
-    *running = true;
-    drop(running);
+    let ip = ip.trim().to_string();
+    ip.parse::<IpAddr>()
+        .map_err(|e| format!("IP 地址解析失败: {}", e))?;
+    begin_session()?;
 
     emit_runtime_log(&app, "info", format!("控制端启动，目标 {}:{}", ip, port));
 
@@ -1043,6 +1217,7 @@ pub fn start_mouse_server(
                     let mut sharing = is_sharing_for_listener.lock().unwrap();
                     if *x >= (screen_width as i32 - 1) && !*sharing {
                         println!("进入共享状态，隐藏光标并置于中心");
+                        hide_cursor();
                         move_cursor_to(center_x, center_y);
                         *sharing = true;
                         // 重置基准
@@ -1210,8 +1385,6 @@ pub fn start_mouse_server(
 
                     // 用于检测共享态从 true -> false 的边沿，触发光标恢复。
                     let mut last_sharing = false;
-                    let mut connection_broken = false;
-
                     while *is_running_main.lock().unwrap() {
                         let sharing = *is_sharing.lock().unwrap();
 
@@ -1235,14 +1408,9 @@ pub fn start_mouse_server(
                             if !batch_data.is_empty() {
                                 if let Err(e) = stream.write_all(&batch_data) {
                                     println!("发送键鼠鼠标数据错误: {}", e);
-                                    connection_broken = true;
                                     break;
                                 }
                             }
-                        }
-
-                        if connection_broken {
-                            break;
                         }
 
                         // 减少 sleep 时间以降低延迟
@@ -1280,7 +1448,66 @@ pub fn start_mouse_server(
         }
 
         // 线程退出时恢复光标
-        show_cursor();
+        finish_session();
+        emit_runtime_log(&app_handle, "info", "控制端已停止");
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pair_code_requires_length_letters_and_digits() {
+        assert!(validate_pair_code_strength("Share123").is_ok());
+        assert!(validate_pair_code_strength("12345678").is_err());
+        assert!(validate_pair_code_strength("abcdefgh").is_err());
+        assert!(validate_pair_code_strength("a1").is_err());
+    }
+
+    #[test]
+    fn data_frame_round_trip_preserves_payload() {
+        let frame = encode_frame(r#"{"kind":"ping"}"#);
+        assert_eq!(decode_frame(&frame).unwrap(), r#"{"kind":"ping"}"#);
+        assert!(decode_frame("BROKEN payload").is_err());
+    }
+
+    #[test]
+    fn file_frames_round_trip_and_checksum() {
+        let bytes = b"hello shared file";
+        let checksum = checksum_update(0, bytes);
+
+        let meta = encode_file_meta("demo.txt", bytes.len() as u64);
+        assert_eq!(
+            decode_file_meta(&meta).unwrap(),
+            ("demo.txt".to_string(), bytes.len() as u64)
+        );
+
+        let done = encode_file_done("demo.txt", bytes.len() as u64, checksum);
+        assert_eq!(
+            decode_file_done(&done).unwrap(),
+            ("demo.txt".to_string(), bytes.len() as u64, checksum)
+        );
+    }
+
+    #[test]
+    fn unique_download_path_does_not_overwrite_existing_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "kms-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let existing = dir.join("demo.txt");
+        std::fs::write(&existing, b"existing").unwrap();
+
+        let next = unique_download_path(&dir, "demo.txt");
+        assert_eq!(next.file_name().unwrap().to_str().unwrap(), "demo (1).txt");
+
+        let _ = std::fs::remove_file(existing);
+        let _ = std::fs::remove_dir(dir);
+    }
 }

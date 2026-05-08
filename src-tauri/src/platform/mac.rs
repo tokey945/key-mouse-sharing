@@ -10,6 +10,8 @@ use core_foundation::string::CFString;
 #[cfg(target_os = "macos")]
 use core_graphics::display::{CGDisplayHideCursor, CGDisplayShowCursor, CGMainDisplayID};
 #[cfg(target_os = "macos")]
+use once_cell::sync::Lazy;
+#[cfg(target_os = "macos")]
 use std::sync::Once;
 #[cfg(target_os = "macos")]
 static INIT: Once = Once::new();
@@ -123,6 +125,16 @@ fn cg_event_mask_bit(event_type: CGEventType) -> CGEventMask {
 }
 
 static TAP_HANDLE: Mutex<Option<usize>> = Mutex::new(None);
+#[cfg(target_os = "macos")]
+static EVENT_LISTENER_INIT: Once = Once::new();
+#[cfg(target_os = "macos")]
+static EVENT_SUBSCRIBERS: Lazy<Mutex<Vec<Sender<AnyEvent>>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+#[cfg(target_os = "macos")]
+fn publish_event(event: AnyEvent) {
+    let mut subscribers = EVENT_SUBSCRIBERS.lock().unwrap();
+    subscribers.retain(|tx| tx.send(event.clone()).is_ok());
+}
 
 /// 屏蔽本地键盘和鼠标按键输入（不影响鼠标移动）
 pub fn block_local_input() {
@@ -307,131 +319,135 @@ pub fn str_to_enigo_key(key: &str) -> Option<enigo::Key> {
 }
 
 pub fn start_event_listener(tx: Sender<AnyEvent>) {
-    std::thread::spawn(move || {
-        let event_types = vec![
-            CGEventType::MouseMoved,
-            CGEventType::LeftMouseDown,
-            CGEventType::LeftMouseUp,
-            CGEventType::RightMouseDown,
-            CGEventType::RightMouseUp,
-            CGEventType::OtherMouseDown,
-            CGEventType::OtherMouseUp,
-            CGEventType::LeftMouseDragged,
-            CGEventType::RightMouseDragged,
-            CGEventType::ScrollWheel,
-            CGEventType::KeyDown,
-            CGEventType::KeyUp,
-        ];
+    EVENT_SUBSCRIBERS.lock().unwrap().push(tx);
 
-        let tap = CGEventTap::new(
-            CGEventTapLocation::HID,
-            CGEventTapPlacement::HeadInsertEventTap,
-            CGEventTapOptions::Default,
-            event_types,
-            move |_, type_, event| {
-                match type_ {
-                    CGEventType::MouseMoved => {
-                        let loc = event.location();
-                        let _ = tx.send(AnyEvent::MouseEvent(MouseEvent {
-                            kind: MouseEventKind::Move {
-                                x: loc.x as i32,
-                                y: loc.y as i32,
-                            },
-                        }));
-                    }
-                    CGEventType::LeftMouseDown
-                    | CGEventType::RightMouseDown
-                    | CGEventType::OtherMouseDown => {
-                        let btn_num =
-                            event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER);
-                        let btn = mouse_to_string(btn_num);
-                        let _ = tx.send(AnyEvent::MouseEvent(MouseEvent {
-                            kind: MouseEventKind::ButtonDown {
-                                button: btn.to_string(),
-                            },
-                        }));
-                    }
-                    CGEventType::LeftMouseUp
-                    | CGEventType::RightMouseUp
-                    | CGEventType::OtherMouseUp => {
-                        let btn_num =
-                            event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER);
-                        let btn = mouse_to_string(btn_num);
-                        let _ = tx.send(AnyEvent::MouseEvent(MouseEvent {
-                            kind: MouseEventKind::ButtonUp {
-                                button: btn.to_string(),
-                            },
-                        }));
-                    }
-                    CGEventType::ScrollWheel => {
-                        let delta = event
-                            .get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1)
-                            as i32;
-                        let _ = tx.send(AnyEvent::MouseEvent(MouseEvent {
-                            kind: MouseEventKind::Wheel { delta },
-                        }));
-                    }
-                    CGEventType::KeyDown => {
-                        let keycode =
-                            event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
-                        let key_str = keycode_to_string(keycode);
-                        let key = if key_str == "Unknown" {
-                            format!("Unknown({})", keycode)
-                        } else {
-                            key_str.to_string()
-                        };
+    EVENT_LISTENER_INIT.call_once(|| {
+        std::thread::spawn(move || {
+            let event_types = vec![
+                CGEventType::MouseMoved,
+                CGEventType::LeftMouseDown,
+                CGEventType::LeftMouseUp,
+                CGEventType::RightMouseDown,
+                CGEventType::RightMouseUp,
+                CGEventType::OtherMouseDown,
+                CGEventType::OtherMouseUp,
+                CGEventType::LeftMouseDragged,
+                CGEventType::RightMouseDragged,
+                CGEventType::ScrollWheel,
+                CGEventType::KeyDown,
+                CGEventType::KeyUp,
+            ];
 
-                        let _ = tx.send(AnyEvent::KeyEvent(KeyEvent {
-                            kind: KeyEventKind::KeyDown { key },
-                        }));
-                    }
-                    CGEventType::KeyUp => {
-                        let keycode =
-                            event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
-                        let key_str = keycode_to_string(keycode);
-                        let key = if key_str == "Unknown" {
-                            format!("Unknown({})", keycode)
-                        } else {
-                            key_str.to_string()
-                        };
+            let tap = CGEventTap::new(
+                CGEventTapLocation::HID,
+                CGEventTapPlacement::HeadInsertEventTap,
+                CGEventTapOptions::Default,
+                event_types,
+                move |_, type_, event| {
+                    match type_ {
+                        CGEventType::MouseMoved => {
+                            let loc = event.location();
+                            publish_event(AnyEvent::MouseEvent(MouseEvent {
+                                kind: MouseEventKind::Move {
+                                    x: loc.x as i32,
+                                    y: loc.y as i32,
+                                },
+                            }));
+                        }
+                        CGEventType::LeftMouseDown
+                        | CGEventType::RightMouseDown
+                        | CGEventType::OtherMouseDown => {
+                            let btn_num = event
+                                .get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER);
+                            let btn = mouse_to_string(btn_num);
+                            publish_event(AnyEvent::MouseEvent(MouseEvent {
+                                kind: MouseEventKind::ButtonDown {
+                                    button: btn.to_string(),
+                                },
+                            }));
+                        }
+                        CGEventType::LeftMouseUp
+                        | CGEventType::RightMouseUp
+                        | CGEventType::OtherMouseUp => {
+                            let btn_num = event
+                                .get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER);
+                            let btn = mouse_to_string(btn_num);
+                            publish_event(AnyEvent::MouseEvent(MouseEvent {
+                                kind: MouseEventKind::ButtonUp {
+                                    button: btn.to_string(),
+                                },
+                            }));
+                        }
+                        CGEventType::ScrollWheel => {
+                            let delta = event.get_integer_value_field(
+                                EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1,
+                            ) as i32;
+                            publish_event(AnyEvent::MouseEvent(MouseEvent {
+                                kind: MouseEventKind::Wheel { delta },
+                            }));
+                        }
+                        CGEventType::KeyDown => {
+                            let keycode =
+                                event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
+                            let key_str = keycode_to_string(keycode);
+                            let key = if key_str == "Unknown" {
+                                format!("Unknown({})", keycode)
+                            } else {
+                                key_str.to_string()
+                            };
 
-                        let _ = tx.send(AnyEvent::KeyEvent(KeyEvent {
-                            kind: KeyEventKind::KeyUp { key },
-                        }));
-                    }
-                    CGEventType::LeftMouseDragged | CGEventType::RightMouseDragged => {
-                        let loc = event.location();
-                        let _ = tx.send(AnyEvent::MouseEvent(MouseEvent {
-                            kind: MouseEventKind::Move {
-                                x: loc.x as i32,
-                                y: loc.y as i32,
-                            },
-                        }));
-                    }
-                    _ => {}
-                }
-                CallbackResult::Keep
-            },
-        )
-        .expect("Failed to create event tap");
+                            publish_event(AnyEvent::KeyEvent(KeyEvent {
+                                kind: KeyEventKind::KeyDown { key },
+                            }));
+                        }
+                        CGEventType::KeyUp => {
+                            let keycode =
+                                event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
+                            let key_str = keycode_to_string(keycode);
+                            let key = if key_str == "Unknown" {
+                                format!("Unknown({})", keycode)
+                            } else {
+                                key_str.to_string()
+                            };
 
-        let mach_port_ref = tap.mach_port().as_concrete_TypeRef();
-        let run_loop_source = unsafe {
-            core_foundation_sys::mach_port::CFMachPortCreateRunLoopSource(
-                kCFAllocatorDefault,
-                mach_port_ref,
-                0,
+                            publish_event(AnyEvent::KeyEvent(KeyEvent {
+                                kind: KeyEventKind::KeyUp { key },
+                            }));
+                        }
+                        CGEventType::LeftMouseDragged | CGEventType::RightMouseDragged => {
+                            let loc = event.location();
+                            publish_event(AnyEvent::MouseEvent(MouseEvent {
+                                kind: MouseEventKind::Move {
+                                    x: loc.x as i32,
+                                    y: loc.y as i32,
+                                },
+                            }));
+                        }
+                        _ => {}
+                    }
+                    CallbackResult::Keep
+                },
             )
-        };
+            .expect("Failed to create event tap");
 
-        unsafe {
-            CFRunLoopAddSource(
-                CFRunLoopGetCurrent(),
-                run_loop_source,
-                kCFRunLoopCommonModes,
-            );
-            CFRunLoopRun();
-        }
+            let mach_port_ref = tap.mach_port().as_concrete_TypeRef();
+            let run_loop_source = unsafe {
+                core_foundation_sys::mach_port::CFMachPortCreateRunLoopSource(
+                    kCFAllocatorDefault,
+                    mach_port_ref,
+                    0,
+                )
+            };
+
+            unsafe {
+                CFRunLoopAddSource(
+                    CFRunLoopGetCurrent(),
+                    run_loop_source,
+                    kCFRunLoopCommonModes,
+                );
+                CFRunLoopRun();
+            }
+        });
     });
 }
 
@@ -569,5 +585,37 @@ pub fn mouse_to_string(btn: i64) -> &'static str {
         3 => "Button4", // 侧键1
         4 => "Button5", // 侧键2
         _ => "Unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use enigo::Key;
+
+    #[test]
+    fn mac_keycode_zero_maps_to_key_a() {
+        assert_eq!(keycode_to_string(0), "KeyA");
+        assert!(matches!(str_to_enigo_key("KeyA"), Some(Key::Layout('a'))));
+    }
+
+    #[test]
+    fn mac_common_modifiers_and_arrows_are_supported() {
+        assert!(matches!(str_to_enigo_key("ShiftLeft"), Some(Key::Shift)));
+        assert!(matches!(
+            str_to_enigo_key("ControlRight"),
+            Some(Key::Control)
+        ));
+        assert!(matches!(str_to_enigo_key("MetaLeft"), Some(Key::Meta)));
+        assert!(matches!(
+            str_to_enigo_key("ArrowLeft"),
+            Some(Key::LeftArrow)
+        ));
+    }
+
+    #[test]
+    fn mac_unknown_keycode_is_explicit() {
+        assert_eq!(keycode_to_string(-1), "Unknown");
+        assert!(str_to_enigo_key("Unknown(-1)").is_none());
     }
 }
