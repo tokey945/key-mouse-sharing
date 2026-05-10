@@ -15,8 +15,8 @@
         "title": "",
         "titleBarStyle": "Overlay",
         "fullscreen": false,
-        "width": 900,
-        "height": 700
+        "width": 940,
+        "height": 860
       }
     ],
     "security": {

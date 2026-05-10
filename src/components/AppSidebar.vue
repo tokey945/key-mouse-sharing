@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Keyboard, CloudUpload, ScreenShare } from 'lucide-vue-next'
+import { Braces, CloudUpload, Keyboard, Settings, Wrench } from 'lucide-vue-next'
 import {
   Sidebar,
   SidebarContent,
@@ -25,9 +25,19 @@ const items = [
     icon: CloudUpload
   },
   {
-    title: '屏幕共享',
-    url: '/screen/sharing',
-    icon: ScreenShare
+    title: '设置',
+    url: '/settings',
+    icon: Settings
+  },
+  {
+    title: '开发工具',
+    url: '/developer/tools',
+    icon: Wrench
+  },
+  {
+    title: '工具箱',
+    url: '/toolbox',
+    icon: Braces
   }
 ]
 </script>

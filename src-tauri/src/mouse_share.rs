@@ -5,46 +5,109 @@ use crate::logic::{
 };
 use base64::Engine;
 use rdev::display_size;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Shutdown, TcpListener, TcpStream};
-use std::sync::mpsc::channel;
+use std::sync::mpsc::{channel, sync_channel, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 
 // 核心说明：
 // 1. `start_mouse_server` 是控制端（主动连接到接收端）；
 // 2. `start_mouse_client` 是接收端（监听端口，执行远端输入）；
-// 3. 握手阶段：配对码验证；
+// 3. 握手阶段：设备身份 + 首次确认/记住设备；
 // 4. 业务阶段：所有消息使用明文 DATA 帧传输。
 lazy_static::lazy_static! {
-    // 线程共享运行状态，stop_sharing 会将其置为 false。
-    static ref IS_RUNNING: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-    // 仅表示当前是否存在已鉴权连接，供输入采集线程判断是否进入共享态。
+    // 键鼠共享运行状态，stop_sharing 会将其置为 false。
+    static ref MOUSE_RUNNING: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    // 文件接收服务跟随键鼠接收端启动，但不阻塞文件发送任务。
+    static ref FILE_RECEIVER_RUNNING: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    // 仅表示当前是否存在已信任连接，供输入采集线程判断是否进入共享态。
     static ref IS_CONNECTED: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-    // 接收端鉴权限流状态（按来源 IP 统计）。
-    static ref AUTH_RATE_LIMITER: Mutex<AuthRateLimiter> = Mutex::new(AuthRateLimiter::default());
+    // 首次确认弹窗的待响应请求。
+    static ref TRUST_REQUESTS: Mutex<HashMap<String, SyncSender<DeviceTrustDecision>>> = Mutex::new(HashMap::new());
+    // 本次运行期已允许的设备，用于“允许一次”后文件通道也能通过。
+    static ref RUNTIME_TRUSTED_DEVICES: Mutex<HashMap<String, TrustedDevice>> = Mutex::new(HashMap::new());
+    static ref CURRENT_CONNECTION: Mutex<ConnectionStateEvent> = Mutex::new(ConnectionStateEvent::disconnected());
+    static ref LAST_REMOTE_CLIPBOARD_HASH: Mutex<Option<u64>> = Mutex::new(None);
 }
 
 // 鼠标移动速度系数，用于平衡不同系统间的鼠标加速差异
 const MOUSE_SPEED_FACTOR: f64 = 1.0;
 
-const AUTH_OK: &str = "AUTH_OK";
-const AUTH_FAIL: &str = "AUTH_FAIL";
+const TRUST_OK: &str = "TRUST_OK";
+const TRUST_DENIED: &str = "TRUST_DENIED";
+const HELLO_PREFIX: &str = "HELLO ";
 const DATA_PREFIX: &str = "DATA ";
+const CLIPBOARD_TEXT_PREFIX: &str = "CLIPBOARD_TEXT ";
+const MAX_CLIPBOARD_TEXT_BYTES: usize = 1024 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
-const AUTH_WINDOW: Duration = Duration::from_secs(60);
-const AUTH_LOCK_DURATION: Duration = Duration::from_secs(120);
-const AUTH_MAX_FAILS: usize = 5;
+const TRUST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Default)]
-struct AuthRateLimiter {
-    // 在 AUTH_WINDOW 时间窗内的失败时间点。
-    failed_attempts: HashMap<IpAddr, Vec<Instant>>,
-    // 被封禁到什么时间点。
-    blocked_until: HashMap<IpAddr, Instant>,
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct DeviceIdentity {
+    #[serde(rename = "deviceId")]
+    device_id: String,
+    #[serde(rename = "deviceName")]
+    device_name: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct TrustedDevice {
+    #[serde(rename = "deviceId")]
+    device_id: String,
+    #[serde(rename = "deviceName")]
+    device_name: String,
+    #[serde(rename = "lastIp")]
+    last_ip: Option<String>,
+    #[serde(rename = "trustedAt")]
+    trusted_at: Option<u64>,
+}
+
+#[derive(serde::Serialize, Clone)]
+struct DeviceTrustRequestEvent {
+    #[serde(rename = "requestId")]
+    request_id: String,
+    #[serde(rename = "deviceId")]
+    device_id: String,
+    #[serde(rename = "deviceName")]
+    device_name: String,
+    #[serde(rename = "peerIp")]
+    peer_ip: String,
+}
+
+#[derive(serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DeviceTrustDecision {
+    AllowOnce,
+    AllowRemember,
+    Deny,
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct ConnectionStateEvent {
+    connected: bool,
+    #[serde(rename = "peerIp")]
+    peer_ip: Option<String>,
+    #[serde(rename = "peerDeviceId")]
+    peer_device_id: Option<String>,
+    #[serde(rename = "peerDeviceName")]
+    peer_device_name: Option<String>,
+}
+
+impl ConnectionStateEvent {
+    fn disconnected() -> Self {
+        Self {
+            connected: false,
+            peer_ip: None,
+            peer_device_id: None,
+            peer_device_name: None,
+        }
+    }
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -75,89 +138,146 @@ fn emit_runtime_log(app: &AppHandle, level: &str, message: impl Into<String>) {
     let _ = app.emit("kms-log", event);
 }
 
-fn begin_session() -> Result<(), String> {
-    let mut running = IS_RUNNING.lock().unwrap();
+fn begin_mouse_session() -> Result<(), String> {
+    let mut running = MOUSE_RUNNING.lock().unwrap();
     if *running {
-        return Err("已有共享任务正在运行，请先停止当前任务".to_string());
+        return Err("已有键鼠共享正在运行，请先停止当前任务".to_string());
     }
     *running = true;
     drop(running);
 
     let mut connected = IS_CONNECTED.lock().unwrap();
     *connected = false;
+    set_connection_state(None, None);
     Ok(())
 }
 
-fn finish_session() {
-    let mut running = IS_RUNNING.lock().unwrap();
+fn finish_mouse_session() {
+    let mut running = MOUSE_RUNNING.lock().unwrap();
     *running = false;
     drop(running);
 
+    let mut file_running = FILE_RECEIVER_RUNNING.lock().unwrap();
+    *file_running = false;
+    drop(file_running);
+
     let mut connected = IS_CONNECTED.lock().unwrap();
     *connected = false;
+    set_connection_state(None, None);
     show_cursor();
 }
 
-// 配对码强度策略：至少 8 位，且必须包含字母+数字。
-fn validate_pair_code_strength(pair_code: &str) -> Result<(), String> {
-    if pair_code.len() < 8 {
-        return Err("配对码至少 8 位".to_string());
+fn begin_file_receiver() -> Result<(), String> {
+    let mut running = FILE_RECEIVER_RUNNING.lock().unwrap();
+    if *running {
+        return Err("文件接收服务已经运行".to_string());
     }
-    let has_alpha = pair_code.chars().any(|c| c.is_ascii_alphabetic());
-    let has_digit = pair_code.chars().any(|c| c.is_ascii_digit());
-    if !(has_alpha && has_digit) {
-        return Err("配对码必须同时包含字母和数字".to_string());
+    *running = true;
+    Ok(())
+}
+
+fn finish_file_receiver() {
+    let mut running = FILE_RECEIVER_RUNNING.lock().unwrap();
+    *running = false;
+}
+
+fn validate_device_identity(identity: &DeviceIdentity) -> Result<(), String> {
+    if identity.device_id.trim().len() < 8 {
+        return Err("设备 ID 无效".to_string());
+    }
+    if identity.device_name.trim().is_empty() {
+        return Err("设备名称不能为空".to_string());
     }
     Ok(())
 }
 
-// 清理时间窗外的失败记录，避免哈希表无限增长。
-fn auth_prune_old_attempts(ip: IpAddr, limiter: &mut AuthRateLimiter, now: Instant) {
-    if let Some(history) = limiter.failed_attempts.get_mut(&ip) {
-        history.retain(|ts| now.duration_since(*ts) <= AUTH_WINDOW);
-        if history.is_empty() {
-            limiter.failed_attempts.remove(&ip);
-        }
+fn set_connection_state(app: Option<&AppHandle>, state: Option<ConnectionStateEvent>) {
+    let next = state.unwrap_or_else(ConnectionStateEvent::disconnected);
+    {
+        let mut current = CURRENT_CONNECTION.lock().unwrap();
+        *current = next.clone();
+    }
+    if let Some(app) = app {
+        let _ = app.emit("kms-connection-state", next);
     }
 }
 
-// 查询某个来源 IP 是否仍在封禁期。
-fn auth_block_remaining(ip: IpAddr) -> Option<Duration> {
-    let now = Instant::now();
-    let mut limiter = AUTH_RATE_LIMITER.lock().unwrap();
-
-    if let Some(until) = limiter.blocked_until.get(&ip).copied() {
-        if until > now {
-            return Some(until.duration_since(now));
-        }
-        limiter.blocked_until.remove(&ip);
-    }
-
-    auth_prune_old_attempts(ip, &mut limiter, now);
-    None
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
-// 记录一次失败；达到阈值后进入临时封禁。
-fn auth_record_failure(ip: IpAddr) {
-    let now = Instant::now();
-    let mut limiter = AUTH_RATE_LIMITER.lock().unwrap();
-    auth_prune_old_attempts(ip, &mut limiter, now);
-    let should_block = {
-        let history = limiter.failed_attempts.entry(ip).or_default();
-        history.push(now);
-        history.len() >= AUTH_MAX_FAILS
+fn trusted_by_config_or_runtime(device_id: &str, trusted_devices: &[TrustedDevice]) -> bool {
+    trusted_devices
+        .iter()
+        .any(|device| device.device_id == device_id)
+        || RUNTIME_TRUSTED_DEVICES
+            .lock()
+            .unwrap()
+            .contains_key(device_id)
+}
+
+fn remember_runtime_device(identity: &DeviceIdentity, peer_ip: IpAddr) {
+    RUNTIME_TRUSTED_DEVICES.lock().unwrap().insert(
+        identity.device_id.clone(),
+        TrustedDevice {
+            device_id: identity.device_id.clone(),
+            device_name: identity.device_name.clone(),
+            last_ip: Some(peer_ip.to_string()),
+            trusted_at: Some(now_ms()),
+        },
+    );
+}
+
+fn request_device_trust(
+    app: &AppHandle,
+    identity: &DeviceIdentity,
+    peer_ip: IpAddr,
+) -> Result<DeviceTrustDecision, String> {
+    let request_id = format!("{}-{}", now_ms(), rand::random::<u32>());
+    let (tx, rx) = sync_channel(1);
+    TRUST_REQUESTS
+        .lock()
+        .unwrap()
+        .insert(request_id.clone(), tx);
+
+    let event = DeviceTrustRequestEvent {
+        request_id: request_id.clone(),
+        device_id: identity.device_id.clone(),
+        device_name: identity.device_name.clone(),
+        peer_ip: peer_ip.to_string(),
     };
-    if should_block {
-        limiter.blocked_until.insert(ip, now + AUTH_LOCK_DURATION);
-        limiter.failed_attempts.remove(&ip);
-    }
+    let _ = app.emit("device-trust-request", event);
+
+    let result = rx
+        .recv_timeout(TRUST_RESPONSE_TIMEOUT)
+        .map_err(|_| "设备确认超时".to_string());
+    TRUST_REQUESTS.lock().unwrap().remove(&request_id);
+    result
 }
 
-// 鉴权成功后，清理该 IP 的历史失败与封禁状态。
-fn auth_record_success(ip: IpAddr) {
-    let mut limiter = AUTH_RATE_LIMITER.lock().unwrap();
-    limiter.failed_attempts.remove(&ip);
-    limiter.blocked_until.remove(&ip);
+fn approve_device_connection(
+    app: &AppHandle,
+    identity: &DeviceIdentity,
+    peer_ip: IpAddr,
+    trusted_devices: &[TrustedDevice],
+) -> Result<(), String> {
+    validate_device_identity(identity)?;
+
+    if trusted_by_config_or_runtime(&identity.device_id, trusted_devices) {
+        remember_runtime_device(identity, peer_ip);
+        return Ok(());
+    }
+
+    match request_device_trust(app, identity, peer_ip)? {
+        DeviceTrustDecision::AllowOnce | DeviceTrustDecision::AllowRemember => {
+            remember_runtime_device(identity, peer_ip);
+            Ok(())
+        }
+        DeviceTrustDecision::Deny => Err("设备连接已被拒绝".to_string()),
+    }
 }
 
 // 简化的明文帧封装。
@@ -172,6 +292,112 @@ fn decode_frame(frame: &str) -> Result<String, String> {
         return Err("数据帧协议不匹配".to_string());
     };
     Ok(rest.to_string())
+}
+
+fn text_hash(text: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn encode_clipboard_text(text: &str) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    format!("{CLIPBOARD_TEXT_PREFIX}{encoded}")
+}
+
+fn decode_clipboard_text(payload: &str) -> Result<Option<String>, String> {
+    let Some(encoded) = payload.trim().strip_prefix(CLIPBOARD_TEXT_PREFIX) else {
+        return Ok(None);
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|e| format!("剪贴板文本 base64 解析失败: {}", e))?;
+    if bytes.len() > MAX_CLIPBOARD_TEXT_BYTES {
+        return Err("剪贴板文本超过 1MB，已拒绝写入".to_string());
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|e| format!("剪贴板文本不是有效 UTF-8: {}", e))
+}
+
+fn send_clipboard_text_if_needed(
+    app: &AppHandle,
+    stream: &mut TcpStream,
+    enabled: bool,
+    context: &str,
+) {
+    if !enabled {
+        return;
+    }
+
+    let mut clipboard = match arboard::Clipboard::new() {
+        Ok(clipboard) => clipboard,
+        Err(e) => {
+            emit_runtime_log(app, "warn", format!("剪贴板不可用，无法同步: {}", e));
+            return;
+        }
+    };
+
+    let text = match clipboard.get_text() {
+        Ok(text) => text,
+        Err(e) => {
+            emit_runtime_log(app, "warn", format!("读取剪贴板文本失败: {}", e));
+            return;
+        }
+    };
+
+    if text.is_empty() {
+        return;
+    }
+
+    if text.len() > MAX_CLIPBOARD_TEXT_BYTES {
+        emit_runtime_log(app, "warn", "剪贴板文本超过 1MB，已跳过同步");
+        return;
+    }
+
+    let hash = text_hash(&text);
+    if LAST_REMOTE_CLIPBOARD_HASH.lock().unwrap().as_ref() == Some(&hash) {
+        emit_runtime_log(app, "info", "剪贴板文本来自远端且未变化，已跳过回传");
+        return;
+    }
+
+    let payload = encode_clipboard_text(&text);
+    let frame = encode_frame(&payload);
+    match stream
+        .write_all(frame.as_bytes())
+        .and_then(|_| stream.flush())
+    {
+        Ok(_) => emit_runtime_log(app, "success", format!("已同步文本剪贴板（{}）", context)),
+        Err(e) => emit_runtime_log(app, "warn", format!("发送剪贴板文本失败: {}", e)),
+    }
+}
+
+fn apply_remote_clipboard_text(app: &AppHandle, text: String) {
+    if text.len() > MAX_CLIPBOARD_TEXT_BYTES {
+        emit_runtime_log(app, "warn", "收到的剪贴板文本超过 1MB，已跳过写入");
+        return;
+    }
+
+    let hash = text_hash(&text);
+    let mut clipboard = match arboard::Clipboard::new() {
+        Ok(clipboard) => clipboard,
+        Err(e) => {
+            emit_runtime_log(
+                app,
+                "warn",
+                format!("剪贴板不可用，无法写入远端文本: {}", e),
+            );
+            return;
+        }
+    };
+
+    match clipboard.set_text(text) {
+        Ok(_) => {
+            *LAST_REMOTE_CLIPBOARD_HASH.lock().unwrap() = Some(hash);
+            emit_runtime_log(app, "success", "已写入远端文本剪贴板");
+        }
+        Err(e) => emit_runtime_log(app, "warn", format!("写入远端剪贴板失败: {}", e)),
+    }
 }
 
 // 文件传输帧定义。
@@ -277,13 +503,13 @@ fn unique_download_path(dir: &std::path::Path, file_name: &str) -> std::path::Pa
     path
 }
 
-// 接收端握手（简化版：无加密）。
-fn authenticate_client_connection(stream: &mut TcpStream, pair_code: &str) -> Result<(), String> {
-    stream
-        .write_all(format!("CHALLENGE {pair_code}\n").as_bytes())
-        .map_err(|e| format!("发送挑战失败: {}", e))?;
-    stream.flush().map_err(|e| format!("刷新挑战失败: {}", e))?;
-
+// 接收端握手：读取对端身份，校验/确认信任后返回身份。
+fn accept_trusted_device(
+    app: &AppHandle,
+    stream: &mut TcpStream,
+    peer_ip: IpAddr,
+    trusted_devices: &[TrustedDevice],
+) -> Result<DeviceIdentity, String> {
     let reader_stream = stream
         .try_clone()
         .map_err(|e| format!("复制连接失败: {}", e))?;
@@ -292,78 +518,123 @@ fn authenticate_client_connection(stream: &mut TcpStream, pair_code: &str) -> Re
     let mut line = String::new();
     let read = reader
         .read_line(&mut line)
-        .map_err(|e| format!("读取握手失败: {}", e))?;
+        .map_err(|e| format!("读取设备握手失败: {}", e))?;
     if read == 0 {
         return Err("握手失败：连接被关闭".to_string());
     }
 
-    let response = line.trim();
-    if response == AUTH_OK {
-        Ok(())
-    } else {
-        let _ = stream.write_all(format!("{AUTH_FAIL}\n").as_bytes());
-        let _ = stream.flush();
-        Err("握手失败：配对码错误".to_string())
+    let Some(payload) = line.trim().strip_prefix(HELLO_PREFIX) else {
+        return Err("握手失败：设备身份协议不匹配".to_string());
+    };
+    let identity = serde_json::from_str::<DeviceIdentity>(payload)
+        .map_err(|e| format!("设备身份解析失败: {}", e))?;
+
+    match approve_device_connection(app, &identity, peer_ip, trusted_devices) {
+        Ok(_) => {
+            stream
+                .write_all(format!("{TRUST_OK}\n").as_bytes())
+                .map_err(|e| format!("发送信任响应失败: {}", e))?;
+            stream
+                .flush()
+                .map_err(|e| format!("刷新信任响应失败: {}", e))?;
+            Ok(identity)
+        }
+        Err(e) => {
+            let _ = stream.write_all(format!("{TRUST_DENIED}\n").as_bytes());
+            let _ = stream.flush();
+            Err(e)
+        }
     }
 }
 
-// 控制端握手（简化版：无加密）。
-fn authenticate_server_connection(stream: &mut TcpStream, pair_code: &str) -> Result<(), String> {
+// 主动连接端握手：发送本机身份，等待对端信任。
+fn request_trusted_connection(
+    stream: &mut TcpStream,
+    identity: &DeviceIdentity,
+) -> Result<(), String> {
+    validate_device_identity(identity)?;
+    let payload =
+        serde_json::to_string(identity).map_err(|e| format!("设备身份序列化失败: {}", e))?;
+    stream
+        .write_all(format!("{HELLO_PREFIX}{payload}\n").as_bytes())
+        .map_err(|e| format!("发送设备身份失败: {}", e))?;
+    stream
+        .flush()
+        .map_err(|e| format!("刷新设备身份失败: {}", e))?;
+
     let reader_stream = stream
         .try_clone()
         .map_err(|e| format!("复制连接失败: {}", e))?;
     let mut reader = BufReader::new(reader_stream);
 
-    let mut challenge = String::new();
+    let mut response = String::new();
     let read = reader
-        .read_line(&mut challenge)
-        .map_err(|e| format!("读取挑战失败: {}", e))?;
+        .read_line(&mut response)
+        .map_err(|e| format!("读取信任响应失败: {}", e))?;
     if read == 0 {
         return Err("握手失败：连接被关闭".to_string());
     }
 
-    let Some(server_pair_code) = challenge.trim().strip_prefix("CHALLENGE ") else {
-        return Err("握手失败：挑战协议不匹配".to_string());
-    };
-
-    if server_pair_code != pair_code {
-        stream
-            .write_all(format!("{AUTH_FAIL}\n").as_bytes())
-            .map_err(|e| format!("发送握手请求失败: {}", e))?;
-        stream
-            .flush()
-            .map_err(|e| format!("刷新握手请求失败: {}", e))?;
-        return Err("握手失败：配对码不匹配".to_string());
+    match response.trim() {
+        TRUST_OK => Ok(()),
+        TRUST_DENIED => Err("对端拒绝了本机设备".to_string()),
+        other => Err(format!("握手失败：未知信任响应 {}", other)),
     }
-
-    stream
-        .write_all(format!("{AUTH_OK}\n").as_bytes())
-        .map_err(|e| format!("发送握手请求失败: {}", e))?;
-    stream
-        .flush()
-        .map_err(|e| format!("刷新握手请求失败: {}", e))?;
-
-    Ok(())
 }
 
 #[tauri::command]
 pub fn stop_sharing(app: AppHandle) {
     // 通过共享开关通知所有工作线程尽快退出，并立即恢复本机可见状态。
-    finish_session();
+    finish_mouse_session();
     emit_runtime_log(&app, "info", "共享已停止");
     println!("停止共享");
 }
 
 #[tauri::command]
-pub fn start_mouse_client(app: AppHandle, port: u16, pair_code: String) -> Result<(), String> {
-    // 先在命令入口做参数合法性校验，避免启动后才失败。
-    let pair_code = pair_code.trim().to_string();
-    validate_pair_code_strength(&pair_code)?;
-    begin_session()?;
+pub fn answer_device_trust(
+    request_id: String,
+    decision: DeviceTrustDecision,
+) -> Result<(), String> {
+    let tx = TRUST_REQUESTS
+        .lock()
+        .unwrap()
+        .remove(request_id.trim())
+        .ok_or_else(|| "设备确认请求不存在或已超时".to_string())?;
+    tx.send(decision)
+        .map_err(|_| "设备确认请求已关闭".to_string())
+}
+
+#[tauri::command]
+pub fn get_connection_state() -> ConnectionStateEvent {
+    CURRENT_CONNECTION.lock().unwrap().clone()
+}
+
+#[tauri::command]
+pub fn start_mouse_client(
+    app: AppHandle,
+    port: u16,
+    file_port: u16,
+    download_dir: String,
+    device_identity: DeviceIdentity,
+    trusted_devices: Vec<TrustedDevice>,
+    clipboard_sharing_enabled: bool,
+) -> Result<(), String> {
+    validate_device_identity(&device_identity)?;
+    begin_mouse_session()?;
 
     emit_runtime_log(&app, "info", format!("客户端启动，监听端口 {}", port));
 
-    let is_running = Arc::clone(&IS_RUNNING);
+    if let Err(e) = start_file_receiver_service(
+        app.clone(),
+        file_port,
+        download_dir,
+        trusted_devices.clone(),
+    ) {
+        finish_mouse_session();
+        return Err(e);
+    }
+
+    let is_running = Arc::clone(&MOUSE_RUNNING);
     let app_handle = app.clone();
     thread::spawn(move || {
         // 客户端角色：监听端口，等待控制端接入。
@@ -381,7 +652,7 @@ pub fn start_mouse_client(app: AppHandle, port: u16, pair_code: String) -> Resul
                             format!("客户端监听失败(IPv4: {}, IPv6: {})", e, e2),
                         );
                         println!("[客户端] 监听端口失败: IPv4={}, IPv6={}", e, e2);
-                        finish_session();
+                        finish_mouse_session();
                         return;
                     }
                 }
@@ -412,44 +683,44 @@ pub fn start_mouse_client(app: AppHandle, port: u16, pair_code: String) -> Resul
                         println!("[客户端] 设置阻塞模式失败: {}", e);
                     }
 
-                    // 限流挡板：封禁窗口内直接拒绝连接，不进入握手流程。
-                    if let Some(remaining) = auth_block_remaining(peer_ip) {
-                        emit_runtime_log(
-                            &app_handle,
-                            "warn",
-                            format!(
-                                "拒绝 {} 的连接：鉴权失败过多，剩余锁定 {} 秒",
-                                peer_ip,
-                                remaining.as_secs()
-                            ),
-                        );
-                        let _ = stream.shutdown(Shutdown::Both);
-                        continue;
-                    }
-
                     println!("客户端已连接: {}", addr);
                     emit_runtime_log(&app_handle, "info", format!("收到连接请求: {}", addr));
 
                     let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
                     let _ = stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
 
-                    // 握手失败计入限流；成功则清空失败历史。
-                    match authenticate_client_connection(&mut stream, &pair_code) {
-                        Ok(_) => {}
+                    let peer_identity = match accept_trusted_device(
+                        &app_handle,
+                        &mut stream,
+                        peer_ip,
+                        &trusted_devices,
+                    ) {
+                        Ok(identity) => identity,
                         Err(e) => {
-                            auth_record_failure(peer_ip);
                             emit_runtime_log(
                                 &app_handle,
                                 "warn",
-                                format!("客户端鉴权失败（{}）: {}", peer_ip, e),
+                                format!("设备信任校验失败（{}）: {}", peer_ip, e),
                             );
                             println!("[客户端] {}", e);
                             let _ = stream.shutdown(Shutdown::Both);
                             continue;
                         }
                     };
-                    auth_record_success(peer_ip);
-                    emit_runtime_log(&app_handle, "success", format!("客户端鉴权通过: {}", addr));
+                    emit_runtime_log(
+                        &app_handle,
+                        "success",
+                        format!("已信任设备: {} ({})", peer_identity.device_name, peer_ip),
+                    );
+                    set_connection_state(
+                        Some(&app_handle),
+                        Some(ConnectionStateEvent {
+                            connected: true,
+                            peer_ip: Some(peer_ip.to_string()),
+                            peer_device_id: Some(peer_identity.device_id.clone()),
+                            peer_device_name: Some(peer_identity.device_name.clone()),
+                        }),
+                    );
 
                     let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
                     let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
@@ -498,6 +769,22 @@ pub fn start_mouse_client(app: AppHandle, port: u16, pair_code: String) -> Resul
                                     break;
                                 }
 
+                                match decode_clipboard_text(&payload) {
+                                    Ok(Some(text)) => {
+                                        apply_remote_clipboard_text(&app_handle, text);
+                                        continue;
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        emit_runtime_log(
+                                            &app_handle,
+                                            "warn",
+                                            format!("剪贴板数据无效: {}", e),
+                                        );
+                                        continue;
+                                    }
+                                }
+
                                 match serde_json::from_str::<AnyEvent>(&payload) {
                                     Ok(AnyEvent::MouseEvent(evt)) => match evt.kind {
                                         MouseEventKind::MoveDelta { dx, dy } => {
@@ -511,6 +798,12 @@ pub fn start_mouse_client(app: AppHandle, port: u16, pair_code: String) -> Resul
 
                                             // 到达左边缘时通知服务端释放
                                             if cur_x <= 1 {
+                                                send_clipboard_text_if_needed(
+                                                    &app_handle,
+                                                    &mut stream,
+                                                    clipboard_sharing_enabled,
+                                                    "释放回控制端",
+                                                );
                                                 let frame = encode_frame("RELEASE");
                                                 let _ = stream.write_all(frame.as_bytes());
                                                 let _ = stream.flush();
@@ -560,10 +853,17 @@ pub fn start_mouse_client(app: AppHandle, port: u16, pair_code: String) -> Resul
 
                     println!("[客户端] 连接断开或循环结束");
                     // 结束前尽量通知控制端恢复本地光标状态。
+                    send_clipboard_text_if_needed(
+                        &app_handle,
+                        &mut stream,
+                        clipboard_sharing_enabled,
+                        "连接断开前",
+                    );
                     let frame = encode_frame("RELEASE");
                     let _ = stream.write_all(frame.as_bytes());
                     let _ = stream.flush();
                     let _ = stream.shutdown(Shutdown::Both);
+                    set_connection_state(Some(&app_handle), None);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(50));
@@ -575,57 +875,49 @@ pub fn start_mouse_client(app: AppHandle, port: u16, pair_code: String) -> Resul
             }
         }
 
-        finish_session();
+        finish_mouse_session();
         emit_runtime_log(&app_handle, "info", "客户端已停止");
     });
     Ok(())
 }
 
-#[tauri::command]
-pub fn start_file_client(
+fn start_file_receiver_service(
     app: AppHandle,
     port: u16,
-    pair_code: String,
     download_dir: String,
+    trusted_devices: Vec<TrustedDevice>,
 ) -> Result<(), String> {
-    let pair_code = pair_code.trim().to_string();
-    validate_pair_code_strength(&pair_code)?;
-
     let download_path = std::path::PathBuf::from(download_dir.trim());
     if !download_path.exists() || !download_path.is_dir() {
         return Err("下载目录不存在或不是目录".to_string());
     }
-    begin_session()?;
+    begin_file_receiver()?;
 
     emit_runtime_log(&app, "info", format!("文件客户端启动，监听端口 {}", port));
 
-    let is_running = Arc::clone(&IS_RUNNING);
+    let listener = match TcpListener::bind(("0.0.0.0", port)) {
+        Ok(listener) => listener,
+        Err(e) => match TcpListener::bind(("::", port)) {
+            Ok(listener) => listener,
+            Err(e2) => {
+                finish_file_receiver();
+                return Err(format!("文件客户端监听失败(IPv4: {}, IPv6: {})", e, e2));
+            }
+        },
+    };
+
+    if let Err(e) = listener.set_nonblocking(true) {
+        println!("[文件客户端] 设置监听非阻塞失败: {}", e);
+    }
+
+    let local_addr = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    let is_running = Arc::clone(&FILE_RECEIVER_RUNNING);
     let app_handle = app.clone();
     thread::spawn(move || {
-        let listener = match TcpListener::bind(("0.0.0.0", port)) {
-            Ok(listener) => listener,
-            Err(e) => match TcpListener::bind(("::", port)) {
-                Ok(listener) => listener,
-                Err(e2) => {
-                    emit_runtime_log(
-                        &app_handle,
-                        "error",
-                        format!("文件客户端监听失败(IPv4: {}, IPv6: {})", e, e2),
-                    );
-                    finish_session();
-                    return;
-                }
-            },
-        };
-
-        if let Err(e) = listener.set_nonblocking(true) {
-            println!("[文件客户端] 设置监听非阻塞失败: {}", e);
-        }
-
-        let local_addr = listener
-            .local_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
         emit_runtime_log(
             &app_handle,
             "info",
@@ -641,42 +933,35 @@ pub fn start_file_client(
                         println!("[文件客户端] 设置阻塞模式失败: {}", e);
                     }
 
-                    // 限流同鼠标共享
-                    if let Some(remaining) = auth_block_remaining(peer_ip) {
-                        emit_runtime_log(
-                            &app_handle,
-                            "warn",
-                            format!(
-                                "拒绝 {} 的连接：鉴权失败过多，剩余锁定 {} 秒",
-                                peer_ip,
-                                remaining.as_secs()
-                            ),
-                        );
-                        let _ = stream.shutdown(Shutdown::Both);
-                        continue;
-                    }
-
                     emit_runtime_log(&app_handle, "info", format!("文件客户端收到连接: {}", addr));
 
                     let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
                     let _ = stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
 
-                    if let Err(e) = authenticate_client_connection(&mut stream, &pair_code) {
-                        auth_record_failure(peer_ip);
-                        emit_runtime_log(
-                            &app_handle,
-                            "warn",
-                            format!("文件客户端鉴权失败({}): {}", peer_ip, e),
-                        );
-                        let _ = stream.shutdown(Shutdown::Both);
-                        continue;
-                    }
-
-                    auth_record_success(peer_ip);
+                    let peer_identity = match accept_trusted_device(
+                        &app_handle,
+                        &mut stream,
+                        peer_ip,
+                        &trusted_devices,
+                    ) {
+                        Ok(identity) => identity,
+                        Err(e) => {
+                            emit_runtime_log(
+                                &app_handle,
+                                "warn",
+                                format!("文件客户端设备信任失败({}): {}", peer_ip, e),
+                            );
+                            let _ = stream.shutdown(Shutdown::Both);
+                            continue;
+                        }
+                    };
                     emit_runtime_log(
                         &app_handle,
                         "success",
-                        format!("文件客户端鉴权通过: {}", addr),
+                        format!(
+                            "文件通道已信任设备: {} ({})",
+                            peer_identity.device_name, addr
+                        ),
                     );
 
                     let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
@@ -937,22 +1222,21 @@ pub fn start_file_client(
         }
 
         emit_runtime_log(&app_handle, "info", "文件客户端已停止");
-        finish_session();
+        finish_file_receiver();
     });
 
     Ok(())
 }
 
 #[tauri::command]
-pub fn start_file_server(
+pub fn send_files(
     app: AppHandle,
     ip: String,
     port: u16,
-    pair_code: String,
+    device_identity: DeviceIdentity,
     file_paths: Vec<String>,
 ) -> Result<(), String> {
-    let pair_code = pair_code.trim().to_string();
-    validate_pair_code_strength(&pair_code)?;
+    validate_device_identity(&device_identity)?;
     let ip = ip.trim().to_string();
     ip.parse::<IpAddr>()
         .map_err(|e| format!("IP 地址解析失败: {}", e))?;
@@ -960,7 +1244,19 @@ pub fn start_file_server(
     if file_paths.is_empty() {
         return Err("请选择至少一个文件".to_string());
     }
-    begin_session()?;
+
+    for path in &file_paths {
+        let path = std::path::Path::new(path);
+        if !path.exists() {
+            return Err(format!("文件不存在: {}", path.display()));
+        }
+        if path.is_dir() {
+            return Err(format!("暂不支持发送目录: {}", path.display()));
+        }
+        if !path.is_file() {
+            return Err(format!("不是可发送的普通文件: {}", path.display()));
+        }
+    }
 
     emit_runtime_log(
         &app,
@@ -968,7 +1264,7 @@ pub fn start_file_server(
         format!("文件服务端启动，目标 {}:{}", ip, port),
     );
 
-    let is_running = Arc::clone(&IS_RUNNING);
+    let is_running = Arc::new(Mutex::new(true));
     let app_handle = app.clone();
     thread::spawn(move || {
         while *is_running.lock().unwrap() {
@@ -991,19 +1287,18 @@ pub fn start_file_server(
                     let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
                     let _ = stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
 
-                    match authenticate_server_connection(&mut stream, &pair_code) {
+                    match request_trusted_connection(&mut stream, &device_identity) {
                         Ok(_) => {
-                            emit_runtime_log(&app_handle, "success", "文件服务端鉴权通过");
+                            emit_runtime_log(&app_handle, "success", "文件通道已建立");
                         }
                         Err(e) => {
                             emit_runtime_log(
                                 &app_handle,
                                 "warn",
-                                format!("文件服务端鉴权失败: {}", e),
+                                format!("文件通道建立失败: {}", e),
                             );
                             let _ = stream.shutdown(Shutdown::Both);
-                            thread::sleep(Duration::from_secs(2));
-                            continue;
+                            break;
                         }
                     }
 
@@ -1131,16 +1426,12 @@ pub fn start_file_server(
                 }
                 Err(e) => {
                     emit_runtime_log(&app_handle, "warn", format!("文件服务端连接失败: {}", e));
-                    if !*is_running.lock().unwrap() {
-                        break;
-                    }
-                    thread::sleep(Duration::from_secs(2));
+                    break;
                 }
             }
         }
 
         emit_runtime_log(&app_handle, "info", "文件服务端退出");
-        finish_session();
     });
 
     Ok(())
@@ -1151,19 +1442,19 @@ pub fn start_mouse_server(
     app: AppHandle,
     ip: String,
     port: u16,
-    pair_code: String,
+    device_identity: DeviceIdentity,
+    clipboard_sharing_enabled: bool,
 ) -> Result<(), String> {
     // 控制端角色：主动连接接收端并转发本机键鼠事件。
-    let pair_code = pair_code.trim().to_string();
-    validate_pair_code_strength(&pair_code)?;
+    validate_device_identity(&device_identity)?;
     let ip = ip.trim().to_string();
     ip.parse::<IpAddr>()
         .map_err(|e| format!("IP 地址解析失败: {}", e))?;
-    begin_session()?;
+    begin_mouse_session()?;
 
     emit_runtime_log(&app, "info", format!("控制端启动，目标 {}:{}", ip, port));
 
-    let is_running = Arc::clone(&IS_RUNNING);
+    let is_running = Arc::clone(&MOUSE_RUNNING);
     let is_running_main = Arc::clone(&is_running);
     let app_handle = app.clone();
     thread::spawn(move || {
@@ -1309,10 +1600,10 @@ pub fn start_mouse_server(
                     let _ = stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
 
                     // 每次新连接都先完成握手。
-                    match authenticate_server_connection(&mut stream, &pair_code) {
+                    match request_trusted_connection(&mut stream, &device_identity) {
                         Ok(_) => {}
                         Err(e) => {
-                            emit_runtime_log(&app_handle, "warn", format!("控制端鉴权失败: {}", e));
+                            emit_runtime_log(&app_handle, "warn", format!("控制端信任失败: {}", e));
                             println!("[控制端] {}", e);
                             let _ = stream.shutdown(Shutdown::Both);
                             thread::sleep(Duration::from_secs(1));
@@ -1327,17 +1618,28 @@ pub fn start_mouse_server(
                         let mut connected = IS_CONNECTED.lock().unwrap();
                         *connected = true;
                     }
-                    emit_runtime_log(&app_handle, "success", "控制端连接成功，鉴权通过");
-                    println!("已连接到服务器，鉴权通过");
+                    emit_runtime_log(&app_handle, "success", "控制端连接成功，设备已信任");
+                    set_connection_state(
+                        Some(&app_handle),
+                        Some(ConnectionStateEvent {
+                            connected: true,
+                            peer_ip: Some(ip.clone()),
+                            peer_device_id: None,
+                            peer_device_name: Some("已连接设备".to_string()),
+                        }),
+                    );
+                    println!("已连接到服务器，设备已信任");
 
                     let is_sharing_recv = Arc::clone(&is_sharing);
                     let is_running_recv = Arc::clone(&is_running_main);
+                    let app_handle_recv = app_handle.clone();
                     let reader_stream = match stream.try_clone() {
                         Ok(s) => s,
                         Err(e) => {
                             println!("复制连接失败: {}", e);
                             let mut connected = IS_CONNECTED.lock().unwrap();
                             *connected = false;
+                            set_connection_state(Some(&app_handle), None);
                             continue;
                         }
                     };
@@ -1372,6 +1674,21 @@ pub fn start_mouse_server(
                                         *sharing = false;
                                         show_cursor();
                                         println!("收到客户端释放信号，恢复本机光标");
+                                        continue;
+                                    }
+
+                                    match decode_clipboard_text(&payload) {
+                                        Ok(Some(text)) => {
+                                            apply_remote_clipboard_text(&app_handle_recv, text);
+                                        }
+                                        Ok(None) => {}
+                                        Err(e) => {
+                                            emit_runtime_log(
+                                                &app_handle_recv,
+                                                "warn",
+                                                format!("剪贴板数据无效: {}", e),
+                                            );
+                                        }
                                     }
                                 }
                                 Err(e) if is_socket_timeout(&e) => continue,
@@ -1390,6 +1707,14 @@ pub fn start_mouse_server(
 
                         if !sharing && last_sharing {
                             show_cursor();
+                        }
+                        if sharing && !last_sharing {
+                            send_clipboard_text_if_needed(
+                                &app_handle,
+                                &mut stream,
+                                clipboard_sharing_enabled,
+                                "进入远端",
+                            );
                         }
                         last_sharing = sharing;
 
@@ -1427,6 +1752,7 @@ pub fn start_mouse_server(
                         let mut connected = IS_CONNECTED.lock().unwrap();
                         *connected = false;
                     }
+                    set_connection_state(Some(&app_handle), None);
                 }
                 Err(e) => {
                     // 连接失败时确保 is_connected 为 false
@@ -1448,7 +1774,7 @@ pub fn start_mouse_server(
         }
 
         // 线程退出时恢复光标
-        finish_session();
+        finish_mouse_session();
         emit_runtime_log(&app_handle, "info", "控制端已停止");
     });
     Ok(())
@@ -1459,11 +1785,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pair_code_requires_length_letters_and_digits() {
-        assert!(validate_pair_code_strength("Share123").is_ok());
-        assert!(validate_pair_code_strength("12345678").is_err());
-        assert!(validate_pair_code_strength("abcdefgh").is_err());
-        assert!(validate_pair_code_strength("a1").is_err());
+    fn device_identity_requires_id_and_name() {
+        assert!(validate_device_identity(&DeviceIdentity {
+            device_id: "device-123".to_string(),
+            device_name: "Mac Studio".to_string(),
+        })
+        .is_ok());
+        assert!(validate_device_identity(&DeviceIdentity {
+            device_id: "short".to_string(),
+            device_name: "Mac Studio".to_string(),
+        })
+        .is_err());
+        assert!(validate_device_identity(&DeviceIdentity {
+            device_id: "device-123".to_string(),
+            device_name: "".to_string(),
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn trusted_device_matches_config_or_runtime() {
+        let trusted = vec![TrustedDevice {
+            device_id: "device-abc".to_string(),
+            device_name: "Known".to_string(),
+            last_ip: None,
+            trusted_at: None,
+        }];
+        assert!(trusted_by_config_or_runtime("device-abc", &trusted));
+        assert!(!trusted_by_config_or_runtime("device-missing", &trusted));
     }
 
     #[test]
@@ -1471,6 +1820,16 @@ mod tests {
         let frame = encode_frame(r#"{"kind":"ping"}"#);
         assert_eq!(decode_frame(&frame).unwrap(), r#"{"kind":"ping"}"#);
         assert!(decode_frame("BROKEN payload").is_err());
+    }
+
+    #[test]
+    fn clipboard_text_frame_round_trip_preserves_unicode() {
+        let payload = encode_clipboard_text("hello 中文\nfn main() {}");
+        assert_eq!(
+            decode_clipboard_text(&payload).unwrap(),
+            Some("hello 中文\nfn main() {}".to_string())
+        );
+        assert_eq!(decode_clipboard_text("RELEASE").unwrap(), None);
     }
 
     #[test]

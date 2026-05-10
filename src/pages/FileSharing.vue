@@ -1,16 +1,15 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
-import { useStorage } from '@vueuse/core'
+import { useRouter } from 'vue-router'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { open } from '@tauri-apps/plugin-dialog'
-import { message } from '@tauri-apps/plugin-dialog'
-import { FolderOpen, Play, Square, Upload } from 'lucide-vue-next'
+import { getCurrentWebview } from '@tauri-apps/api/webview'
+import { open, message } from '@tauri-apps/plugin-dialog'
+import { Send, Settings, Trash2, Upload, X } from 'lucide-vue-next'
 import RuntimeLogPanel from '@/components/RuntimeLogPanel.vue'
 import { Button } from '@/components/ui/button'
-import { Label } from '@/components/ui/label'
-import { Input } from '@/components/ui/input'
-import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
+import { useAppSettings } from '@/composables/useAppSettings'
+import { connectionState } from '@/composables/useConnectionState'
 
 interface LogItem {
   at: number
@@ -24,34 +23,26 @@ interface RuntimeLogEvent {
   ts_ms?: number
 }
 
-const role = useStorage('file-share-role', 'server')
-const ip = useStorage('file-share-ip', '192.168.1.5')
-const port = useStorage('file-share-port', 5001)
-const pairCode = useStorage('file-share-pair-code', 'Share2026')
-const downloadDir = useStorage('file-share-download-dir', '')
-
+const router = useRouter()
+const settings = useAppSettings()
 const selectedFiles = ref<string[]>([])
-const isRunning = ref(false)
 const isProcessing = ref(false)
 const logs = ref<LogItem[]>([])
 const logFilter = ref<'all' | 'info' | 'success' | 'warn' | 'error'>('all')
 const activeFile = ref('')
 const activeProgress = ref(0)
+const isDraggingFiles = ref(false)
 
-const canStart = computed(() => !isRunning.value && !isProcessing.value)
-const canStop = computed(() => isRunning.value && !isProcessing.value)
 const statusLabel = computed(() => {
-  if (isProcessing.value) return '处理中'
-  if (isRunning.value) return role.value === 'server' ? '发送端运行中' : '接收端监听中'
-  return '空闲'
+  if (connectionState.value.connected) return `已连接 ${connectionState.value.peerDeviceName || connectionState.value.peerIp || '远端'}`
+  return '等待键鼠共享连接'
 })
-const statusClass = computed(() => (isRunning.value ? 'bg-emerald-500' : isProcessing.value ? 'bg-amber-500' : 'bg-muted-foreground'))
+const statusClass = computed(() => connectionState.value.connected ? 'bg-emerald-500' : 'bg-amber-500')
+const canSend = computed(() => connectionState.value.connected && selectedFiles.value.length > 0 && !isProcessing.value)
 
 const appendLog = (entry: LogItem) => {
   logs.value.push(entry)
-  if (logs.value.length > 200) {
-    logs.value.splice(0, logs.value.length - 200)
-  }
+  if (logs.value.length > 200) logs.value.splice(0, logs.value.length - 200)
 
   const progress = entry.message.match(/^(.+?) 传输中: ([\d.]+)%/)
   if (progress) {
@@ -67,24 +58,40 @@ const appendLog = (entry: LogItem) => {
   }
 }
 
-const pushLog = (level: LogItem['level'], msg: string) => {
-  appendLog({ at: Date.now(), level, message: msg })
-}
-
+const pushLog = (level: LogItem['level'], msg: string) => appendLog({ at: Date.now(), level, message: msg })
 const clearLogs = () => {
   logs.value = []
   activeFile.value = ''
   activeProgress.value = 0
 }
 
-const isTauriRuntime = () =>
-  typeof window !== 'undefined' &&
-  typeof (window as typeof window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ === 'object'
-const isValidPairCode = (value: string) => value.length >= 8 && /[A-Za-z]/.test(value) && /\d/.test(value)
+const addFiles = (paths: string[]) => {
+  const normalized = paths.filter(Boolean)
+  if (normalized.length === 0) return
 
-if (!isValidPairCode(pairCode.value)) {
-  pairCode.value = 'Share2026'
+  const seen = new Set(selectedFiles.value)
+  let added = 0
+  for (const path of normalized) {
+    if (seen.has(path)) continue
+    selectedFiles.value.push(path)
+    seen.add(path)
+    added += 1
+  }
+
+  pushLog('info', added > 0 ? `已加入 ${added} 个文件` : '拖入的文件已在列表中')
 }
+
+const removeFile = (file: string) => {
+  selectedFiles.value = selectedFiles.value.filter((item) => item !== file)
+}
+
+const clearSelectedFiles = () => {
+  selectedFiles.value = []
+  pushLog('info', '已清空待发送文件')
+}
+
+const isTauriRuntime = () =>
+  typeof window !== 'undefined' && typeof (window as typeof window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ === 'object'
 
 const notify = async (text: string) => {
   if (isTauriRuntime()) {
@@ -95,9 +102,15 @@ const notify = async (text: string) => {
 }
 
 let unlistenLogEvent: UnlistenFn | null = null
+let unlistenDragDropEvent: UnlistenFn | null = null
 onMounted(() => {
+  if (!connectionState.value.connected) {
+    pushLog('warn', '文件共享需要先建立键鼠共享连接')
+  }
+
   if (!isTauriRuntime()) {
     pushLog('warn', '当前为浏览器模式，无法订阅后端实时日志事件')
+    pushLog('warn', '当前为浏览器模式，文件拖拽仅在桌面应用内可用')
     return
   }
 
@@ -105,20 +118,40 @@ onMounted(() => {
     const payload = event.payload
     const rawLevel = payload?.level ?? 'info'
     const level = ['info', 'success', 'warn', 'error'].includes(rawLevel) ? (rawLevel as LogItem['level']) : 'info'
-    const at = payload?.ts_ms ?? Date.now()
-    appendLog({ at, level, message: payload?.message ?? '' })
+    appendLog({ at: payload?.ts_ms ?? Date.now(), level, message: payload?.message ?? '' })
   }).then((fn) => {
     unlistenLogEvent = fn
   }).catch((err) => {
     pushLog('warn', `订阅日志失败: ${err?.toString?.() ?? err}`)
   })
+
+  getCurrentWebview().onDragDropEvent((event) => {
+    const payload = event.payload
+    if (payload.type === 'enter' || payload.type === 'over') {
+      isDraggingFiles.value = true
+      return
+    }
+    if (payload.type === 'leave') {
+      isDraggingFiles.value = false
+      return
+    }
+    if (payload.type === 'drop') {
+      isDraggingFiles.value = false
+      addFiles(payload.paths)
+      if (!connectionState.value.connected) {
+        pushLog('warn', '文件已加入列表，请先建立键鼠共享连接后再发送')
+      }
+    }
+  }).then((fn) => {
+    unlistenDragDropEvent = fn
+  }).catch((err) => {
+    pushLog('warn', `文件拖拽监听失败: ${err?.toString?.() ?? err}`)
+  })
 })
 
 onUnmounted(() => {
-  if (unlistenLogEvent) {
-    unlistenLogEvent()
-    unlistenLogEvent = null
-  }
+  unlistenLogEvent?.()
+  unlistenDragDropEvent?.()
 })
 
 const chooseFiles = async () => {
@@ -130,123 +163,41 @@ const chooseFiles = async () => {
   try {
     const paths = await open({ multiple: true, directory: false })
     if (Array.isArray(paths)) {
-      selectedFiles.value = paths.filter(Boolean) as string[]
-      pushLog('info', `已选择 ${selectedFiles.value.length} 个文件`)
+      addFiles(paths.filter(Boolean) as string[])
     }
   } catch (error: any) {
     pushLog('error', `文件选择失败: ${error?.message ?? error}`)
   }
 }
 
-const chooseDownloadDir = async () => {
-  if (!isTauriRuntime()) {
-    pushLog('warn', '请在桌面应用模式下使用目录选择功能')
-    return
-  }
-
-  try {
-    const dir = await open({ directory: true })
-    if (typeof dir === 'string' && dir) {
-      downloadDir.value = dir
-      pushLog('info', `下载目录已设置为 ${dir}`)
-    }
-  } catch (error: any) {
-    pushLog('error', `目录选择失败: ${error?.message ?? error}`)
-  }
+const goConnect = async () => {
+  await notify('请先建立键鼠共享连接')
+  router.push('/')
 }
 
-const start = async () => {
-  if (!canStart.value) return
-
-  if (!isTauriRuntime()) {
-    pushLog('warn', '当前为浏览器模式，无法调用后端共享能力')
-    await notify('请使用 `npm run tauri dev` 启动桌面应用后再测试')
+const send = async () => {
+  if (!connectionState.value.connected || !connectionState.value.peerIp) {
+    await goConnect()
     return
   }
-
-  const portValue = Number(port.value)
-  if (!Number.isInteger(portValue) || portValue < 1 || portValue > 65535) {
-    await notify('端口范围必须是 1-65535')
-    pushLog('error', `端口无效: ${portValue}`)
-    return
-  }
-
-  const currentPairCode = pairCode.value.trim()
-  if (!isValidPairCode(currentPairCode)) {
-    await notify('配对码至少 8 位，且必须包含字母和数字')
-    pushLog('error', '配对码无效：需要至少 8 位并包含字母+数字')
+  if (selectedFiles.value.length === 0) {
+    await notify('请先选择要发送的文件')
     return
   }
 
   isProcessing.value = true
   try {
-    if (role.value === 'server') {
-      if (selectedFiles.value.length === 0) {
-        await notify('请先选择要发送的文件')
-        pushLog('warn', '未选择文件')
-        return
-      }
-
-      const targetIp = ip.value.trim()
-      if (!targetIp) {
-        await notify('请输入目标 IP 地址')
-        pushLog('warn', '目标 IP 为空')
-        return
-      }
-
-      await invoke('start_file_server', {
-        ip: targetIp,
-        port: portValue,
-        pairCode: currentPairCode,
-        filePaths: selectedFiles.value,
-      })
-      isRunning.value = true
-      pushLog('success', `文件服务端已启动，目标 ${targetIp}:${portValue}`)
-      await notify('文件服务端已启动')
-      return
-    }
-
-    if (!downloadDir.value) {
-      await notify('请先选择下载目录')
-      pushLog('warn', '下载目录未设置')
-      return
-    }
-
-    await invoke('start_file_client', {
-      port: portValue,
-      pairCode: currentPairCode,
-      downloadDir: downloadDir.value,
+    await invoke('send_files', {
+      ip: connectionState.value.peerIp,
+      port: Number(settings.filePort.value),
+      deviceIdentity: settings.deviceIdentity(),
+      filePaths: selectedFiles.value,
     })
-    isRunning.value = true
-    pushLog('success', `文件客户端已启动，监听端口 ${portValue}`)
-    await notify('文件客户端已启动')
+    pushLog('success', `已发起 ${selectedFiles.value.length} 个文件的发送任务`)
   } catch (error: any) {
-    const msg = error?.message || '未知错误'
-    pushLog('error', `启动失败: ${msg}`)
-    await notify(`启动失败: ${msg}`)
-  } finally {
-    isProcessing.value = false
-  }
-}
-
-const stop = async () => {
-  if (!canStop.value) return
-
-  if (!isTauriRuntime()) {
-    pushLog('warn', '当前为浏览器模式，无共享会话可停止')
-    return
-  }
-
-  isProcessing.value = true
-  try {
-    await invoke('stop_sharing')
-    isRunning.value = false
-    pushLog('info', '已停止共享')
-    await notify('已停止共享')
-  } catch (error: any) {
-    const msg = error?.message || '未知错误'
-    pushLog('error', `停止失败: ${msg}`)
-    await notify(`停止失败: ${msg}`)
+    const msg = error?.message || error || '未知错误'
+    pushLog('error', `发送失败: ${msg}`)
+    await notify(`发送失败: ${msg}`)
   } finally {
     isProcessing.value = false
   }
@@ -258,7 +209,7 @@ const stop = async () => {
     <header class="flex flex-wrap items-center justify-between gap-3 rounded-lg border bg-background px-4 py-3">
       <div>
         <h1 class="text-base font-semibold">文件共享</h1>
-        <p class="text-xs text-muted-foreground">局域网直连传输，完成时校验大小与传输校验值。</p>
+        <p class="text-xs text-muted-foreground">复用已建立的键鼠信任关系，通过独立文件端口传输并校验完整性。</p>
       </div>
       <div class="flex items-center gap-2 rounded-md border px-3 py-1.5 text-sm">
         <span class="size-2 rounded-full" :class="statusClass" />
@@ -268,53 +219,62 @@ const stop = async () => {
 
     <div class="grid min-h-0 flex-1 gap-4 lg:grid-cols-[380px_minmax(0,1fr)]">
       <section class="space-y-4 rounded-lg border bg-background p-4">
-        <div class="space-y-2">
-          <Label>角色</Label>
-          <RadioGroup v-model="role" default-value="server" :orientation="'horizontal'" class="grid grid-cols-2 gap-2">
-            <Label for="fs-r1" class="flex cursor-pointer items-center gap-2 rounded-md border px-3 py-2 text-sm">
-              <RadioGroupItem id="fs-r1" value="server" />
-              发送端
-            </Label>
-            <Label for="fs-r2" class="flex cursor-pointer items-center gap-2 rounded-md border px-3 py-2 text-sm">
-              <RadioGroupItem id="fs-r2" value="client" />
-              接收端
-            </Label>
-          </RadioGroup>
+        <div v-if="!connectionState.connected" class="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200">
+          还没有键鼠共享连接。请先连接到另一台设备，文件共享会自动复用该连接。
         </div>
 
-        <div v-if="role === 'server'" class="grid gap-1.5">
-          <Label for="target-ip">目标 IP</Label>
-          <Input id="target-ip" v-model="ip" type="text" class="focus-visible:ring-0" />
-        </div>
-
-        <div class="grid gap-1.5">
-          <Label for="sharing-port">端口</Label>
-          <Input id="sharing-port" v-model.number="port" type="number" min="1" max="65535" class="focus-visible:ring-0" />
-        </div>
-
-        <div class="grid gap-1.5">
-          <Label for="pair-code">配对码</Label>
-          <Input id="pair-code" v-model="pairCode" class="focus-visible:ring-0" />
-          <p class="text-xs text-muted-foreground">至少 8 位，包含字母和数字。</p>
-        </div>
-
-        <div v-if="role === 'server'" class="space-y-2 rounded-md border p-3">
-          <Button type="button" size="sm" variant="outline" class="gap-2" @click="chooseFiles">
-            <Upload class="size-4" />
-            选择文件
-          </Button>
-          <div class="text-xs text-muted-foreground">已选 {{ selectedFiles.length }} 个文件</div>
-          <ul class="max-h-28 space-y-1 overflow-hidden text-xs">
-            <li v-for="file in selectedFiles" :key="file" class="truncate rounded bg-muted px-2 py-1">{{ file }}</li>
+        <div
+          class="space-y-3 rounded-md border border-dashed p-3 transition-colors"
+          :class="isDraggingFiles ? 'border-primary bg-primary/5' : 'border-border bg-background'"
+        >
+          <div class="flex items-center justify-between gap-2">
+            <Button type="button" size="sm" variant="outline" class="gap-2" @click="chooseFiles">
+              <Upload class="size-4" />
+              选择文件
+            </Button>
+            <Button
+              v-if="selectedFiles.length > 0"
+              type="button"
+              size="sm"
+              variant="ghost"
+              class="gap-2"
+              @click="clearSelectedFiles"
+            >
+              <Trash2 class="size-4" />
+              清空
+            </Button>
+          </div>
+          <div class="rounded-md bg-muted/60 px-3 py-2 text-xs text-muted-foreground">
+            {{ isDraggingFiles ? '松开鼠标加入待发送列表' : '可将文件拖到这里，拖入后不会自动发送' }}
+          </div>
+          <div class="text-xs text-muted-foreground">待发送 {{ selectedFiles.length }} 个文件</div>
+          <ul class="max-h-44 space-y-1 overflow-auto pr-1 text-xs">
+            <li
+              v-for="file in selectedFiles"
+              :key="file"
+              class="flex items-center gap-2 rounded bg-muted px-2 py-1"
+            >
+              <span class="min-w-0 flex-1 truncate">{{ file }}</span>
+              <Button type="button" size="icon" variant="ghost" class="size-6 shrink-0" @click="removeFile(file)">
+                <X class="size-3.5" />
+              </Button>
+            </li>
           </ul>
         </div>
 
-        <div v-if="role === 'client'" class="space-y-2 rounded-md border p-3">
-          <Button type="button" size="sm" variant="outline" class="gap-2" @click="chooseDownloadDir">
-            <FolderOpen class="size-4" />
-            选择下载目录
-          </Button>
-          <div class="truncate text-xs text-muted-foreground">下载目录：{{ downloadDir || '未设置' }}</div>
+        <div class="space-y-2 rounded-md border p-3 text-sm">
+          <div class="flex items-center justify-between">
+            <span class="text-muted-foreground">目标</span>
+            <span class="font-medium">{{ connectionState.peerIp || '未连接' }}</span>
+          </div>
+          <div class="flex items-center justify-between">
+            <span class="text-muted-foreground">文件端口</span>
+            <span class="font-medium">{{ settings.filePort.value }}</span>
+          </div>
+          <RouterLink to="/settings" class="inline-flex items-center gap-2 text-xs text-primary hover:underline">
+            <Settings class="size-3.5" />
+            修改文件端口或接收目录
+          </RouterLink>
         </div>
 
         <div class="rounded-md border p-3">
@@ -328,13 +288,12 @@ const stop = async () => {
         </div>
 
         <div class="flex gap-2 pt-2">
-          <Button class="flex-1 gap-2" @click="start" :disabled="!canStart">
-            <Play class="size-4" />
-            启动
+          <Button v-if="connectionState.connected" class="flex-1 gap-2" @click="send" :disabled="!canSend">
+            <Send class="size-4" />
+            发送文件
           </Button>
-          <Button class="flex-1 gap-2" @click="stop" variant="destructive" :disabled="!canStop">
-            <Square class="size-4" />
-            停止
+          <Button v-else class="flex-1 gap-2" variant="secondary" @click="goConnect">
+            先连接键鼠共享
           </Button>
         </div>
       </section>
