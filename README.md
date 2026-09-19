@@ -1,16 +1,102 @@
-# Tauri + Vue + TypeScript
+# key-mouse-sharing
 
-This template should help get you started developing with Vue 3 and TypeScript in Vite. The template uses Vue 3 `<script setup>` SFCs, check out the [script setup docs](https://v3.vuejs.org/api/sfc-script-setup.html#sfc-script-setup) to learn more.
+基于 Tauri 2、Vue 3 和 Rust 的局域网键鼠与文件共享工具。当前版本重点稳定 macOS 上的键鼠共享、设备信任和文件传输。
 
-## Recommended IDE Setup
+## 功能状态
 
-- [VS Code](https://code.visualstudio.com/) + [Volar](https://marketplace.visualstudio.com/items?itemName=Vue.volar) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+- 键鼠共享：控制端主动连接接收端，鼠标触达右侧屏幕边缘后开始转发键鼠事件，远端回到左侧边缘释放。
+- 设备信任：去除配对码，未知设备首次连接时由接收端确认；可选择允许一次或记住设备。
+- 文件共享：跟随键鼠共享启用，接收端启动键鼠监听时自动启动文件接收服务；发送端在文件页选择文件后直接发送。
+- 设置页：集中维护设备名称、默认目标 IP、键鼠端口、文件端口、下载目录和受信设备。
+- 开发工具：提供本机网络摘要、端口占用检查和 TCP 连接探测，方便调试局域网连接问题。
+- 程序员工具箱：提供时间戳、JSON、Base64/URL、Hash、AES-GCM、JWT、UUID/随机值、正则、Cron 和 Linux 常用命令速查。
+- 局域网发现：设置页已预留设备发现区块，后续可扩展为自动发现和一键连接。
 
-## Type Support For `.vue` Imports in TS
+## 运行
 
-Since TypeScript cannot handle type information for `.vue` imports, they are shimmed to be a generic Vue component type by default. In most cases this is fine if you don't really care about component prop types outside of templates. However, if you wish to get actual prop types in `.vue` imports (for example to get props validation when using manual `h(...)` calls), you can enable Volar's Take Over mode by following these steps:
+```bash
+npm ci
+npm run tauri dev
+```
 
-1. Run `Extensions: Show Built-in Extensions` from VS Code's command palette, look for `TypeScript and JavaScript Language Features`, then right click and select `Disable (Workspace)`. By default, Take Over mode will enable itself if the default TypeScript extension is disabled.
-2. Reload the VS Code window by running `Developer: Reload Window` from the command palette.
+前端浏览器预览：
 
-You can learn more about Take Over mode [here](https://github.com/johnsoncodehk/volar/discussions/471).
+```bash
+npm run dev
+```
+
+生产构建：
+
+```bash
+npm run build
+npm run tauri build
+```
+
+## macOS 权限
+
+键鼠共享需要系统权限，否则无法捕获或模拟输入：
+
+- 系统设置 -> 隐私与安全性 -> 辅助功能：允许本应用或开发中的终端。
+- 系统设置 -> 隐私与安全性 -> 输入监控：允许本应用或开发中的终端。
+
+如果 `cargo check` 或 `git` 报 Xcode license 错误，需要先在本机终端处理 Xcode license。项目不会自动执行 `sudo` 或修改系统授权。
+
+## 使用方式
+
+1. 两台设备连接到同一局域网。
+2. 在“设置”页填写本机设备名称、默认目标 IP、键鼠端口、文件端口和文件接收目录。
+3. 接收端在“键鼠共享”页选择“客户端”，启动监听。文件接收服务会随之自动启动。
+4. 控制端在“键鼠共享”页选择“控制端”，启动连接。
+5. 首次连接时，接收端确认是否允许该设备连接；选择“允许并记住”后，下次会自动通过。
+6. 键鼠共享时，控制端鼠标移动到右侧边缘进入共享；远端鼠标到左侧边缘释放。
+7. 文件共享需要先建立键鼠共享连接；连接后到“文件共享”页选择文件并发送。
+
+## 测试
+
+```bash
+npm run typecheck
+npm run build
+npm run audit
+cargo test --manifest-path src-tauri/Cargo.toml
+cargo check --manifest-path src-tauri/Cargo.toml
+```
+
+文件传输建议覆盖：
+
+- 空文件、小文件、大文件、多文件。
+- 首次连接允许一次、允许并记住、拒绝和确认超时。
+- 接收目录无效。
+- 传输中停止。
+- 目标目录已有同名文件。
+
+键鼠共享建议覆盖：
+
+- 重复启动与停止。
+- 未知设备首次确认与已信任设备自动通过。
+- 触边进入共享和远端释放。
+- A 键、修饰键、方向键、鼠标拖拽、滚轮。
+
+开发工具建议覆盖：
+
+- 本机网络摘要能返回局域网 IP 或明确显示未检测到。
+- 端口检查能区分空闲端口和已占用端口。
+- TCP 探测能报告目标 IP/端口的可达性与耗时。
+
+程序员工具箱建议覆盖：
+
+- 时间戳秒/毫秒输入都能正确识别并转换。
+- JSON 格式化/压缩对合法 JSON 正常，对非法 JSON 显示错误。
+- Base64/URL 编解码支持中文。
+- Hash 输出与已知字符串 `hello` 的 SHA-256 对齐。
+- AES-GCM 加密结果可被同一口令解回原文，错误口令解密失败。
+- JWT 能解析标准三段 token，非法 token 显示错误。
+- UUID/随机值长度与格式符合预期。
+- 正则能展示多处匹配和捕获组。
+- Cron 对常见 5 段表达式给出解释和后续时间。
+- Linux 命令搜索能按关键词过滤。
+
+## 已知限制
+
+- 网络协议仍是局域网明文传输，只适合可信网络；设备信任用于降低误连风险，不等同端到端加密。
+- 当前不是高性能远控方案，没有屏幕编码/低延迟视频链路。
+- Windows 平台保持兼容性维护，当前主要验收平台是 macOS。

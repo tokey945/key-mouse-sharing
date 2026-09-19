@@ -15,12 +15,12 @@
         "title": "",
         "titleBarStyle": "Overlay",
         "fullscreen": false,
-        "width": 900,
-        "height": 700
+        "width": 940,
+        "height": 860
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost"
     }
   },
   "bundle": {
