@@ -3,7 +3,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { message } from '@tauri-apps/plugin-dialog'
-import { Play, Settings, Square } from 'lucide-vue-next'
+import { Laptop, Play, Radar, RefreshCw, Settings, Square } from 'lucide-vue-next'
 import { RouterLink } from 'vue-router'
 import RuntimeLogPanel from '@/components/RuntimeLogPanel.vue'
 import { Button } from '@/components/ui/button'
@@ -11,6 +11,7 @@ import { Label } from '@/components/ui/label'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { useAppSettings } from '@/composables/useAppSettings'
 import { connectionState } from '@/composables/useConnectionState'
+import { useLanDiscovery, type LanDevice } from '@/composables/useLanDiscovery'
 
 type LogLevel = 'info' | 'success' | 'warn' | 'error'
 type LogFilter = 'all' | LogLevel
@@ -28,6 +29,7 @@ interface RuntimeLogEvent {
 }
 
 const settings = useAppSettings()
+const lan = useLanDiscovery()
 const role = settings.defaultRole
 const isRunning = ref(false)
 const isProcessing = ref(false)
@@ -35,7 +37,7 @@ const logs = ref<LogItem[]>([])
 const logFilter = ref<LogFilter>('all')
 
 const canStart = computed(() => !isRunning.value && !isProcessing.value)
-const canStop = computed(() => isRunning.value && !isProcessing.value)
+const canStop = computed(() => (isRunning.value || connectionState.value.connected) && !isProcessing.value)
 const statusLabel = computed(() => {
   if (isProcessing.value) return '处理中'
   if (connectionState.value.connected) return `已连接 ${connectionState.value.peerDeviceName || connectionState.value.peerIp || '远端'}`
@@ -69,6 +71,44 @@ const notify = async (text: string) => {
 }
 
 const isValidPort = (value: number) => Number.isInteger(Number(value)) && Number(value) >= 1 && Number(value) <= 65535
+
+const refreshDevices = async () => {
+  if (!isTauriRuntime()) return
+  try {
+    await invoke('start_device_discovery', {
+      deviceIdentity: settings.deviceIdentity(),
+      mousePort: Number(settings.mousePort.value),
+    })
+    await invoke('announce_device_now')
+    lan.connectionMessage.value = '正在刷新局域网设备…'
+  } catch (error: any) {
+    lan.connectionMessage.value = `刷新失败：${error?.message || error || '未知错误'}`
+  }
+}
+
+const connectDevice = async (device: LanDevice) => {
+  if (!isTauriRuntime() || lan.pendingRequestId.value) return
+  lan.connectingDeviceId.value = device.deviceId
+  lan.connectionMessage.value = `等待 ${device.deviceName} 确认…`
+  try {
+    const requestId = await invoke<string>('request_lan_connection', {
+      targetIp: device.ip,
+      targetDeviceId: device.deviceId,
+    })
+    lan.pendingRequestId.value = requestId
+    window.setTimeout(() => {
+      if (lan.pendingRequestId.value === requestId) {
+        lan.pendingRequestId.value = null
+        lan.connectingDeviceId.value = null
+        lan.connectionMessage.value = '连接请求已超时，请重试'
+      }
+    }, 31_000)
+  } catch (error: any) {
+    lan.pendingRequestId.value = null
+    lan.connectingDeviceId.value = null
+    lan.connectionMessage.value = `请求失败：${error?.message || error || '未知错误'}`
+  }
+}
 
 let unlistenLogEvent: UnlistenFn | null = null
 onMounted(async () => {
@@ -123,10 +163,6 @@ const start = async () => {
       })
       pushLog('success', `控制端已启动，目标 ${targetIp}:${settings.mousePort.value}`)
     } else {
-      if (!settings.downloadDir.value) {
-        await notify('请先在设置页选择文件接收目录')
-        return
-      }
       await invoke('start_mouse_client', {
         port: Number(settings.mousePort.value),
         filePort: Number(settings.filePort.value),
@@ -220,6 +256,45 @@ const stop = async () => {
             <Settings class="size-3.5" />
             修改默认连接设置
           </RouterLink>
+        </div>
+
+        <div class="space-y-2 rounded-md border p-3">
+          <div class="flex items-center justify-between gap-2">
+            <div class="flex items-center gap-2 text-sm font-medium">
+              <Radar class="size-4" />
+              局域网设备
+            </div>
+            <Button size="icon" variant="ghost" class="size-7" title="刷新设备" @click="refreshDevices">
+              <RefreshCw class="size-3.5" />
+            </Button>
+          </div>
+          <div v-if="lan.devices.value.length === 0" class="rounded-md border border-dashed p-3 text-center text-xs text-muted-foreground">
+            暂未发现设备，请确认两端位于同一局域网且应用均已打开。
+          </div>
+          <div v-else class="max-h-44 space-y-2 overflow-auto">
+            <div
+              v-for="device in lan.devices.value"
+              :key="device.deviceId"
+              class="flex items-center gap-2 rounded-md border p-2"
+            >
+              <Laptop class="size-4 shrink-0 text-muted-foreground" />
+              <div class="min-w-0 flex-1">
+                <div class="truncate text-xs font-medium">{{ device.deviceName }}</div>
+                <div class="truncate text-[11px] text-muted-foreground">{{ device.ip }}:{{ device.mousePort }}</div>
+              </div>
+              <Button
+                size="sm"
+                class="h-7 px-2 text-xs"
+                :disabled="Boolean(lan.pendingRequestId.value) || connectionState.connected"
+                @click="connectDevice(device)"
+              >
+                {{ lan.connectingDeviceId.value === device.deviceId ? '等待确认' : '连接' }}
+              </Button>
+            </div>
+          </div>
+          <p v-if="lan.connectionMessage.value" class="text-xs text-muted-foreground">
+            {{ lan.connectionMessage.value }}
+          </p>
         </div>
 
         <div class="flex gap-2 pt-2">

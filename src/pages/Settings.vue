@@ -109,7 +109,7 @@ const chooseDownloadDir = async () => {
             局域网设备发现
           </div>
           <p class="text-xs leading-5 text-muted-foreground">
-            已预留发现区块。下一步会通过局域网广播展示在线设备，并支持一键写入默认目标 IP。
+            应用启动后会通过 UDP 广播自动发现同一局域网内的设备。设备列表与一键连接入口位于“键鼠共享”页面。
           </p>
         </div>
       </section>

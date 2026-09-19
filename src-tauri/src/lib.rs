@@ -1,5 +1,6 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 mod dev_tools;
+mod discovery;
 mod logic;
 mod mouse_share;
 pub mod platform;
@@ -22,6 +23,10 @@ pub fn run() {
             mouse_share::send_files,
             mouse_share::answer_device_trust,
             mouse_share::get_connection_state,
+            discovery::start_device_discovery,
+            discovery::request_lan_connection,
+            discovery::answer_lan_connection,
+            discovery::announce_device_now,
             dev_tools::get_network_summary,
             dev_tools::check_port_available,
             dev_tools::probe_tcp_connection,

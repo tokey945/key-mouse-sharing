@@ -51,9 +51,9 @@ const TRUST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct DeviceIdentity {
     #[serde(rename = "deviceId")]
-    device_id: String,
+    pub(crate) device_id: String,
     #[serde(rename = "deviceName")]
-    device_name: String,
+    pub(crate) device_name: String,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug, PartialEq, Eq)]
@@ -228,6 +228,20 @@ fn remember_runtime_device(identity: &DeviceIdentity, peer_ip: IpAddr) {
             last_ip: Some(peer_ip.to_string()),
             trusted_at: Some(now_ms()),
         },
+    );
+}
+
+pub(crate) fn allow_runtime_discovered_device(
+    device_id: String,
+    device_name: String,
+    peer_ip: IpAddr,
+) {
+    remember_runtime_device(
+        &DeviceIdentity {
+            device_id,
+            device_name,
+        },
+        peer_ip,
     );
 }
 
@@ -624,7 +638,9 @@ pub fn start_mouse_client(
 
     emit_runtime_log(&app, "info", format!("客户端启动，监听端口 {}", port));
 
-    if let Err(e) = start_file_receiver_service(
+    if download_dir.trim().is_empty() {
+        emit_runtime_log(&app, "warn", "未配置下载目录，文件接收服务未启动");
+    } else if let Err(e) = start_file_receiver_service(
         app.clone(),
         file_port,
         download_dir,
