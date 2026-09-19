@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { message } from '@tauri-apps/plugin-dialog'
+import { gsap } from 'gsap'
 import { Laptop, Play, Radar, RefreshCw, Settings, Square } from 'lucide-vue-next'
 import { RouterLink } from 'vue-router'
 import RuntimeLogPanel from '@/components/RuntimeLogPanel.vue'
@@ -71,6 +72,67 @@ const notify = async (text: string) => {
 }
 
 const isValidPort = (value: number) => Number.isInteger(Number(value)) && Number(value) >= 1 && Number(value) <= 65535
+
+const prefersReducedMotion = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches
+
+const onDeviceBeforeEnter = (element: Element) => {
+  if (prefersReducedMotion()) return
+  gsap.set(element, { autoAlpha: 0, x: -10, scale: 0.985 })
+}
+
+const onDeviceEnter = (element: Element, done: () => void) => {
+  if (prefersReducedMotion()) {
+    done()
+    return
+  }
+  const index = Number((element as HTMLElement).dataset.index || 0)
+  gsap.to(element, {
+    autoAlpha: 1,
+    x: 0,
+    scale: 1,
+    duration: 0.3,
+    delay: Math.min(index * 0.045, 0.22),
+    ease: 'power2.out',
+    clearProps: 'transform,opacity,visibility',
+    onComplete: done,
+  })
+}
+
+const onDeviceLeave = (element: Element, done: () => void) => {
+  if (prefersReducedMotion()) {
+    done()
+    return
+  }
+  gsap.to(element, {
+    autoAlpha: 0,
+    x: 8,
+    height: 0,
+    marginTop: 0,
+    duration: 0.2,
+    ease: 'power1.in',
+    onComplete: done,
+  })
+}
+
+const onMessageEnter = (element: Element, done: () => void) => {
+  if (prefersReducedMotion()) {
+    done()
+    return
+  }
+  gsap.fromTo(
+    element,
+    { autoAlpha: 0, y: 4 },
+    { autoAlpha: 1, y: 0, duration: 0.2, ease: 'power2.out', onComplete: done },
+  )
+}
+
+const onMessageLeave = (element: Element, done: () => void) => {
+  if (prefersReducedMotion()) {
+    done()
+    return
+  }
+  gsap.to(element, { autoAlpha: 0, y: -3, duration: 0.12, ease: 'power1.in', onComplete: done })
+}
 
 const refreshDevices = async () => {
   if (!isTauriRuntime()) return
@@ -271,10 +333,19 @@ const stop = async () => {
           <div v-if="lan.devices.value.length === 0" class="rounded-md border border-dashed p-3 text-center text-xs text-muted-foreground">
             暂未发现设备，请确认两端位于同一局域网且应用均已打开。
           </div>
-          <div v-else class="max-h-44 space-y-2 overflow-auto">
+          <TransitionGroup
+            v-else
+            tag="div"
+            class="max-h-44 space-y-2 overflow-auto"
+            :css="false"
+            @before-enter="onDeviceBeforeEnter"
+            @enter="onDeviceEnter"
+            @leave="onDeviceLeave"
+          >
             <div
-              v-for="device in lan.devices.value"
+              v-for="(device, index) in lan.devices.value"
               :key="device.deviceId"
+              :data-index="index"
               class="flex items-center gap-2 rounded-md border p-2"
             >
               <Laptop class="size-4 shrink-0 text-muted-foreground" />
@@ -291,10 +362,12 @@ const stop = async () => {
                 {{ lan.connectingDeviceId.value === device.deviceId ? '等待确认' : '连接' }}
               </Button>
             </div>
-          </div>
-          <p v-if="lan.connectionMessage.value" class="text-xs text-muted-foreground">
-            {{ lan.connectionMessage.value }}
-          </p>
+          </TransitionGroup>
+          <Transition :css="false" mode="out-in" @enter="onMessageEnter" @leave="onMessageLeave">
+            <p v-if="lan.connectionMessage.value" :key="lan.connectionMessage.value" class="text-xs text-muted-foreground">
+              {{ lan.connectionMessage.value }}
+            </p>
+          </Transition>
         </div>
 
         <div class="flex gap-2 pt-2">

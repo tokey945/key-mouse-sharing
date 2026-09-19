@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { gsap } from 'gsap'
 import { SidebarProvider, SidebarTrigger } from '@/components/ui/sidebar'
 import AppSidebar from '@/components/AppSidebar.vue'
 import ColorMode from '@/components/ColorMode.vue'
@@ -50,6 +51,42 @@ let pruneTimer: number | null = null
 const isTauriRuntime = () =>
   typeof window !== 'undefined' &&
   typeof (window as typeof window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ === 'object'
+
+const prefersReducedMotion = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches
+
+const onRouteBeforeEnter = (element: Element) => {
+  if (prefersReducedMotion()) return
+  gsap.set(element, { autoAlpha: 0, y: 10 })
+}
+
+const onRouteEnter = (element: Element, done: () => void) => {
+  if (prefersReducedMotion()) {
+    done()
+    return
+  }
+  gsap.to(element, {
+    autoAlpha: 1,
+    y: 0,
+    duration: 0.28,
+    ease: 'power2.out',
+    clearProps: 'transform,opacity,visibility',
+    onComplete: done,
+  })
+}
+
+const onRouteLeave = (element: Element, done: () => void) => {
+  if (prefersReducedMotion()) {
+    done()
+    return
+  }
+  gsap.to(element, {
+    autoAlpha: 0,
+    y: -6,
+    duration: 0.16,
+    ease: 'power1.in',
+    onComplete: done,
+  })
+}
 
 const answerTrust = async (decision: 'allowOnce' | 'allowRemember' | 'deny') => {
   const request = trustRequest.value
@@ -194,8 +231,20 @@ onUnmounted(() => {
         <SidebarTrigger />
         <ColorMode />
       </div>
-      <div class="flex-1 min-h-0">
-        <RouterView />
+      <div class="flex-1 min-h-0 overflow-hidden">
+        <RouterView v-slot="{ Component, route }">
+          <Transition
+            mode="out-in"
+            :css="false"
+            @before-enter="onRouteBeforeEnter"
+            @enter="onRouteEnter"
+            @leave="onRouteLeave"
+          >
+            <div :key="route.fullPath" class="h-full min-h-0">
+              <component :is="Component" />
+            </div>
+          </Transition>
+        </RouterView>
       </div>
     </main>
   </SidebarProvider>
